@@ -31,9 +31,9 @@ class EchoChannel(BaseChannel):
         yield ThoughtDelta(text=f"echoing {len(request.prompt)} chars")
         yield ToolStarted(name="inspect", args={"chars": len(request.prompt)})
         yield ToolCompleted(name="inspect", status="success", result=None)
-        words = request.prompt.split()
-        for i, word in enumerate(words):
-            yield TextDelta(text=word + (" " if i < len(words) - 1 else ""))
+        text = request.prompt
+        for i in range(0, len(text), 7):
+            yield TextDelta(text=text[i : i + 7])
         yield TurnCompleted(
             session_id=request.native_session_id or f"echo-{request.session_id}",
             model=request.model or self.models[0],

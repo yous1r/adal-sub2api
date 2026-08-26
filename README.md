@@ -40,6 +40,50 @@ sub2api --port 8080
 SUB2API_CHANNEL=adal-cli python -m sub2api
 ```
 
+## OpenAI 兼容接口（可接入 cliproxyapi 等聚合器）
+
+`sub2api` 同时暴露标准 OpenAI Chat Completions 协议，任何支持自定义 `base_url` 的客户端/网关都能直接把它当 OpenAI 上游使用：
+
+| 端点 | 说明 |
+|---|---|
+| `POST /v1/chat/completions` | 兼容 `messages` / `model` / `stream`；`stream: true` 时输出 `chat.completion.chunk` SSE，以 `data: [DONE]` 结束 |
+| `GET /v1/models` | OpenAI 格式模型列表（来自当前渠道的 `models` 声明） |
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}'
+```
+
+映射规则：
+
+- `messages` 摊平成单轮 prompt：单条 user 消息取原文；多角色历史转为 `[SYSTEM]/[USER]/[ASSISTANT]` 标记文本（渠道按一次性请求消费）。
+- 思考增量（`thought.delta`）映射为 DeepSeek 风格的 `delta.reasoning_content`；工具事件不透传。
+- 流中失败：终帧附 `error` 对象后正常收尾 `[DONE]`；非流失败返回 OpenAI 错误形状 `{"error":{"message","type","code"}}`。
+- 该路由的权限模式由 `SUB2API_OPENAI_PERMISSION_MODE` 控制（默认 `yolo`——headless 调用方无法批准工具确认）。**公网部署务必配合 `SUB2API_API_KEY` 与 `SUB2API_ENABLED_TOOLS` 白名单收敛风险。**
+
+### cliproxyapi 接入示例
+
+cliproxyapi 侧把 sub2api 配为一个 OpenAI 兼容上游即可：
+
+```yaml
+openai-compatibility:
+  - name: sub2api-adal
+    base-url: http://127.0.0.1:8080/v1
+    api-keys: ["<SUB2API_API_KEY>"]   # 未设置 SUB2API_API_KEY 时留空
+    models:
+      - name: "claude-sonnet-4-6"
+```
+
+任何 OpenAI SDK 同样直连：
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+client.chat.completions.create(model="claude-sonnet-4-6",
+                               messages=[{"role": "user", "content": "hi"}])
+```
+
 ### API
 
 | 端点 | 说明 |
@@ -73,6 +117,9 @@ SSE 帧类型：`session.started` → `thought.delta` / `text.delta` / `message.
 | `SUB2API_HOST` / `SUB2API_PORT` | `127.0.0.1` / `8080` | 监听地址 |
 | `SUB2API_WORKSPACE` | `.` | 渠道默认工作目录 |
 | `SUB2API_AUTH_TOKEN` | — | 显式 JWT（如 AdaL 的 `access_token`），CI 无浏览器时用 |
+| `SUB2API_API_KEY` | — | 设置后 `/v1/*` 全部要求 `Authorization: Bearer <key>`（`/healthz` 除外） |
+| `SUB2API_OPENAI_PERMISSION_MODE` | `yolo` | OpenAI 兼容路由使用的权限模式 |
+| `SUB2API_ENABLED_TOOLS` | — | 部署级工具白名单（逗号分隔），请求未显式指定时生效 |
 | `SUB2API_RUNTIME_PATH` | — | 渠道运行时路径（如 adal 可执行文件） |
 | `SUB2API_CHANNEL_OPTIONS` | — | JSON，透传给渠道的额外选项 |
 
@@ -116,7 +163,7 @@ class MyChannel(BaseChannel):
 ## 测试
 
 ```bash
-pytest -q          # 50 个用例：契约、注册表、会话、聚合、两个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面
+pytest -q          # 65 个用例：契约、注册表、会话、聚合、两个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层
 ```
 
 无需安装 AdaL 即可跑全部测试——AdaL 渠道用假运行时（临时启动器脚本）做子进程级验证，SDK 渠道测纯映射函数。

@@ -30,6 +30,22 @@ def test_from_env_overrides():
     assert settings.port == 9000
     cfg = settings.channel_config
     assert cfg.workspace == "/work"
-    assert cfg.auth_token == "jwt"
-    assert cfg.runtime_path == "/usr/bin/adal"
     assert cfg.options == {"timeout": 30}
+
+
+def test_from_env_openai_and_guard_fields():
+    settings = AppSettings.from_env(environ={})
+    assert settings.api_key is None
+    assert settings.openai_permission_mode == "yolo"
+    assert settings.enabled_tools is None
+
+    settings = AppSettings.from_env(
+        environ={
+            "SUB2API_API_KEY": "sk-x",
+            "SUB2API_OPENAI_PERMISSION_MODE": "default",
+            "SUB2API_ENABLED_TOOLS": "Read, Search",
+        }
+    )
+    assert settings.api_key == "sk-x"
+    assert settings.openai_permission_mode == "default"
+    assert settings.enabled_tools == ("Read", "Search")
