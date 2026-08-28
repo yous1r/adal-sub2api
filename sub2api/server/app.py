@@ -69,6 +69,21 @@ def error_response(
     return JSONResponse(status_code=status_code, content=payload)
 
 
+def passthrough_json(resp: httpx.Response) -> Any:
+    """Safely extract JSON from an upstream response.
+
+    The proxy may return non-JSON bodies on error (HTML, plain text, empty),
+    which would crash ``resp.json()``.  Fall back to the raw text so the
+    client still sees the status code and body.
+    """
+    if not resp.content:
+        return {}
+    try:
+        return resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return {"raw": resp.text[:2000]}
+
+
 def sse_frame(event: Event) -> str:
     return f"data: {json.dumps(event.to_dict(), ensure_ascii=False)}\n\n"
 
@@ -289,7 +304,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             await channel.release_slot(slot, success=resp.status_code < 500)
             return JSONResponse(
                 status_code=resp.status_code,
-                content=resp.json() if resp.content else {},
+                content=passthrough_json(resp),
             )
         chat_request = ChatRequest(
             prompt=oai.messages_to_prompt([m.model_dump() for m in body.messages]),
@@ -416,7 +431,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise
         await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
-            status_code=resp.status_code, content=resp.json() if resp.content else {}
+            status_code=resp.status_code, content=passthrough_json(resp)
         )
 
     @app.post("/v1/responses")
@@ -493,7 +508,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise
         await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
-            status_code=resp.status_code, content=resp.json() if resp.content else {}
+            status_code=resp.status_code, content=passthrough_json(resp)
         )
 
     @app.get("/v1/responses/{response_id}")
@@ -528,7 +543,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise
         await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
-            status_code=resp.status_code, content=resp.json() if resp.content else {}
+            status_code=resp.status_code, content=passthrough_json(resp)
         )
 
     @app.delete("/v1/responses/{response_id}")
@@ -563,7 +578,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise
         await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
-            status_code=resp.status_code, content=resp.json() if resp.content else {}
+            status_code=resp.status_code, content=passthrough_json(resp)
         )
 
     @app.post("/v1/v1/responses")
