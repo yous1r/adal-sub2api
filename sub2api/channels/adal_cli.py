@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import shutil
 from typing import AsyncIterator, ClassVar
 
@@ -29,6 +30,25 @@ from ..core.types import (
 )
 
 DEFAULT_RUNTIME = "adal"
+MODEL_CATALOG_PATH = Path.home() / ".adal" / "model_catalog.json"
+
+
+def load_catalog(path: Path | None = None) -> tuple[str, ...]:
+    """Read the CLI's cached model catalog (refreshed by every `adal` run).
+
+    ``path`` defaults to the module-level :data:`MODEL_CATALOG_PATH`,
+    resolved at call time so tests can point it elsewhere.
+
+    Returns model registry keys in catalog order; empty when the file is
+    missing/unparsable so the class-level fallback stays authoritative.
+    """
+    try:
+        data = json.loads(Path(path or MODEL_CATALOG_PATH).read_text(encoding="utf-8"))
+        models = data["models"]
+        keys = tuple(m["key"] for m in models if isinstance(m, dict) and m.get("key"))
+        return keys
+    except (OSError, ValueError, KeyError, TypeError):
+        return ()
 
 
 def build_args(runtime: str, request: ChatRequest) -> list[str]:
@@ -46,6 +66,8 @@ def build_args(runtime: str, request: ChatRequest) -> list[str]:
         args += ["--enabled-default-tools", ",".join(request.enabled_tools)]
     if request.permission_mode == "yolo":
         args += ["--yolo"]
+    if request.thinking_effort:
+        args += ["--thinking-effort", request.thinking_effort]
     return args
 
 
@@ -83,10 +105,18 @@ def parse_line(line: str) -> Event | None:
 class AdalCliChannel(BaseChannel):
     name: ClassVar[str] = "adal-cli"
     display_name: ClassVar[str] = "AdaL (headless CLI)"
+    # Fallback when the CLI's catalog file is absent (e.g. tests, fresh installs).
     models: ClassVar[tuple[str, ...]] = (
-        "claude-sonnet-4-20250514",
-        "claude-sonnet-4-6",
+        "anthropic-claude-sonnet-4-6",
+        "anthropic-claude-opus-4-6",
+        "anthropic-claude-sonnet-5",
+        "anthropic-claude-opus-5",
     )
+
+    async def _start(self) -> None:
+        catalog = load_catalog()
+        if catalog:
+            self.models = catalog  # instance-level: newest Pro catalog wins
 
     @property
     def runtime(self) -> str:

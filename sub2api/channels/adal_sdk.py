@@ -73,8 +73,10 @@ class AdalSdkChannel(BaseChannel):
     name: ClassVar[str] = "adal-sdk"
     display_name: ClassVar[str] = "AdaL (Python SDK)"
     models: ClassVar[tuple[str, ...]] = (
-        "claude-sonnet-4-6",
-        "gpt-5-codex",
+        "anthropic-claude-sonnet-4-6",
+        "anthropic-claude-opus-4-6",
+        "anthropic-claude-sonnet-5",
+        "anthropic-claude-opus-5",
     )
 
     async def _start(self) -> None:
@@ -84,6 +86,11 @@ class AdalSdkChannel(BaseChannel):
                 "run: pip install git+https://github.com/SylphAI-Inc/adal-sdk.git"
             )
         self._sdk = importlib.import_module(SDK_PACKAGE)
+        from .adal_cli import load_catalog
+
+        catalog = load_catalog()
+        if catalog:
+            self.models = catalog  # instance-level: newest Pro catalog wins
 
     def runtime_available(self) -> bool:
         if importlib.util.find_spec(SDK_PACKAGE) is None:

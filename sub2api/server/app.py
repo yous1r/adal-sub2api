@@ -8,6 +8,7 @@ the registry.
 from __future__ import annotations
 
 import json
+import httpx
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
@@ -44,8 +45,7 @@ class ChatBody(BaseModel):
     enabled_tools: list[str] | None = None
     workspace: str | None = None
     images: list[str] | None = None
-    context_files: list[str] | None = None
-    extra: dict[str, Any] = Field(default_factory=dict)
+    thinking_effort: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -57,6 +57,8 @@ class CompletionBody(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     model: str | None = None
     stream: bool = False
+    thinking_effort: str | None = None
+    reasoning_effort: str | None = None  # OpenAI-compat alias for thinking_effort
 
 
 def error_response(status_code: int, code: str, message: str, **extra: Any) -> JSONResponse:
@@ -134,8 +136,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             permission_mode=body.permission_mode,
             enabled_tools=effective_tools(body.enabled_tools),
             images=tuple(body.images) if body.images else None,
-            context_files=tuple(body.context_files) if body.context_files else None,
-            extra=body.extra,
+            thinking_effort=body.thinking_effort,
         )
 
     @app.post("/v1/chat")
@@ -222,12 +223,37 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         denial = unauthorized(request)
         if denial is not None:
             return denial
+        # Fast path: when the channel is a transparent cloud proxy, forward the
+        # client's OpenAI request verbatim — tools, usage, and the full
+        # multi-turn messages array all pass through unchanged.
+        if channel_supports_passthrough():
+            raw = await request.body()
+            body_dict = json.loads(raw) if raw else {}
+            target = channel.resolve_target("/v1/chat/completions", body_dict)
+            sid = await channel.proxy_session_id()
+            headers = channel.proxy_headers(sid, target, channel.resolve_provider(body_dict))
+            url = f"{channel.proxy_url}/proxy/v1/chat/completions"
+            fwd_body = channel.rewrite_body(raw)
+            client = channel._client
+            assert client is not None
+            if body.stream:
+                async def fwd_openai() -> AsyncIterator[bytes]:
+                    async with client.stream("POST", url, content=fwd_body, headers=headers) as resp:
+                        async for chunk in resp.aiter_raw():
+                            yield chunk
+                return StreamingResponse(fwd_openai(), media_type="text/event-stream")
+            # Non-streaming: use a dedicated request with a short read timeout
+            # so upstream errors (403/502) return fast instead of hanging.
+            resp = await client.post(url, content=fwd_body, headers=headers,
+                                     timeout=httpx.Timeout(300.0, connect=15.0, read=60.0))
+            return JSONResponse(status_code=resp.status_code,
+                                content=resp.json() if resp.content else {})
         chat_request = ChatRequest(
             prompt=oai.messages_to_prompt([m.model_dump() for m in body.messages]),
             session_id=None,
             model=body.model,
             permission_mode=settings.openai_permission_mode,
-            enabled_tools=effective_tools(None),
+            thinking_effort=body.thinking_effort or body.reasoning_effort,
         )
         created = oai.now_epoch()
         if body.stream:
@@ -260,6 +286,78 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             for m in channel.models
         ]
         return {"object": "list", "data": data}
+
+    # -- native passthrough ------------------------------------------------
+    # When the active channel is a transparent cloud proxy (e.g. adal-cloud),
+    # forward Anthropic (/v1/messages) and OpenAI (/v1/chat/completions)
+    # requests verbatim to the proxy. This skips the normalized-event layer
+    # entirely — CLIProxyAPI (or any Anthropic/OpenAI client) speaks its own
+    # protocol end-to-end with zero loss (tools, usage, multi-turn all pass).
+
+    def channel_supports_passthrough() -> bool:
+        return all(hasattr(channel, m) for m in ("proxy_session_id", "proxy_headers", "resolve_target", "resolve_provider", "rewrite_body"))
+
+    @app.post("/v1/messages")
+    async def messages_passthrough(request: Request):
+        """Anthropic Messages API passthrough to the cloud proxy."""
+        denial = unauthorized(request)
+        if denial is not None:
+            return denial
+        if not channel_supports_passthrough():
+            return JSONResponse(
+                status_code=501,
+                content=oai.openai_error(
+                    f"channel `{channel.name}` has no native passthrough",
+                    err_type="api_error", code="channel_not_supported",
+                ),
+            )
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return JSONResponse(
+                status_code=400,
+                content=oai.openai_error("invalid JSON body", err_type="invalid_request_error", code="bad_request"),
+            )
+        target = channel.resolve_target("/v1/messages", body)
+        sid = await channel.proxy_session_id()
+        headers = channel.proxy_headers(sid, target, channel.resolve_provider(body))
+        stream = bool(body.get("stream"))
+        url = channel.proxy_url + "/proxy/v1/messages"
+        if not url:
+            return JSONResponse(status_code=501, content=oai.openai_error("proxy url missing", err_type="api_error"))
+        fwd_body = channel.rewrite_body(raw)
+        client = channel._client
+        assert client is not None
+        if stream:
+            async def fwd() -> AsyncIterator[bytes]:
+                async with client.stream("POST", url, content=fwd_body, headers=headers) as resp:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+        resp = await client.post(url, content=fwd_body, headers=headers,
+                                 timeout=httpx.Timeout(300.0, connect=15.0, read=60.0))
+        return JSONResponse(status_code=resp.status_code,
+                            content=resp.json() if resp.content else {})
+
+    @app.post("/v1/v1/messages")
+    async def messages_passthrough_v1v1(request: Request):
+        """Compat alias for clients whose base-url includes /v1 twice."""
+        return await messages_passthrough(request)
+
+    @app.post("/v1/v1/chat/completions")
+    async def chat_completions_v1v1(body: CompletionBody, request: Request):
+        """Compat alias for clients whose base-url includes /v1 twice."""
+        return await chat_completions(body, request)
+
+    @app.post("/v1/completions")
+    async def completions_compat(body: CompletionBody, request: Request):
+        """Compat alias for legacy /v1/completions (maps to chat/completions)."""
+        return await chat_completions(body, request)
+
+    @app.get("/models")
+    async def models_compat(request: Request):
+        """Compat alias for GET /models (without /v1 prefix)."""
+        return await list_models(request)
 
     @app.get("/v1/channels")
     async def channels():

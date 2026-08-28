@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar
 
 PERMISSION_MODES = ("default", "acceptEdits", "yolo")
+THINKING_EFFORTS = ("low", "medium", "high", "max")
 
 
 @dataclass(slots=True)
@@ -30,6 +31,7 @@ class ChatRequest:
     workspace: str | None = None
     permission_mode: str = "default"
     enabled_tools: tuple[str, ...] | None = None
+    thinking_effort: str | None = None
     images: tuple[str, ...] | None = None
     context_files: tuple[str, ...] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -37,6 +39,8 @@ class ChatRequest:
     def __post_init__(self) -> None:
         if self.permission_mode not in PERMISSION_MODES:
             raise ValueError(f"permission_mode must be one of {PERMISSION_MODES}")
+        if self.thinking_effort is not None and self.thinking_effort not in THINKING_EFFORTS:
+            raise ValueError(f"thinking_effort must be one of {THINKING_EFFORTS} or None")
 
 
 class Event:
