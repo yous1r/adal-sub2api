@@ -34,6 +34,7 @@ Docs: https://docs.sylph.ai/cloud-agents/overview
 
 from __future__ import annotations
 
+import uuid
 import asyncio
 import json
 import time
@@ -81,9 +82,12 @@ def save_cached_session(session_id: str) -> None:
     """Persist a registered session id for reuse across restarts."""
     try:
         SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SESSION_PATH.write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
+        SESSION_PATH.write_text(
+            json.dumps({"session_id": session_id}), encoding="utf-8"
+        )
     except OSError:
         pass
+
 
 # provider (from the catalog) -> (proxy sub-path, upstream target base URL).
 # Anthropic-style providers POST /proxy/v1/messages; OpenAI-style providers
@@ -98,7 +102,10 @@ PROVIDER_TARGETS: dict[str, tuple[str, str]] = {
     "kimi": ("/v1/chat/completions", "https://api.moonshot.ai/v1"),
     "minimax": ("/v1/messages", "https://api.minimax.io/anthropic"),
     "xai": ("/v1/chat/completions", "https://api.x.ai/v1"),
-    "qwen": ("/v1/chat/completions", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    "qwen": (
+        "/v1/chat/completions",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    ),
     "meta": ("/v1/chat/completions", "https://api.meta.ai/v1"),
 }
 
@@ -133,7 +140,9 @@ def token_needs_refresh(token: str | None, *, now: int | None = None) -> bool:
     return exp - (now if now is not None else int(time.time())) <= TOKEN_REFRESH_SKEW
 
 
-def initiate_device_flow(app_url: str = ADAL_APP_URL, timeout: float = 15.0) -> dict[str, Any]:
+def initiate_device_flow(
+    app_url: str = ADAL_APP_URL, timeout: float = 15.0
+) -> dict[str, Any]:
     """Start the OAuth device-code flow; return the initiate response dict."""
     req = Request(
         f"{app_url}/api/auth/device/initiate",
@@ -205,7 +214,9 @@ def device_flow_login(
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(
-                    json.dumps({"access_token": token, "expiry_date": (exp or 0) * 1000}),
+                    json.dumps(
+                        {"access_token": token, "expiry_date": (exp or 0) * 1000}
+                    ),
                     encoding="utf-8",
                 )
             except OSError:
@@ -217,7 +228,9 @@ def device_flow_login(
     raise AuthError("device flow timed out waiting for user authorization")
 
 
-def fetch_catalog(proxy_url: str = ADAL_PROXY_URL, timeout: float = 20.0) -> dict[str, Any]:
+def fetch_catalog(
+    proxy_url: str = ADAL_PROXY_URL, timeout: float = 20.0
+) -> dict[str, Any]:
     """Fetch the live model catalog (no auth required)."""
     req = Request(f"{proxy_url}/proxy/models/catalog")
     try:
@@ -254,7 +267,9 @@ def upstream_model_id(catalog: dict[str, Any], model: str) -> str:
     models = catalog.get("models") if isinstance(catalog, dict) else None
     if isinstance(models, list):
         for m in models:
-            if isinstance(m, dict) and (m.get("key") == model or m.get("model_id") == model):
+            if isinstance(m, dict) and (
+                m.get("key") == model or m.get("model_id") == model
+            ):
                 return m.get("model_id") or model
     return model
 
@@ -294,7 +309,10 @@ def register_session(
     req = Request(
         f"{app_url}/api/client-sessions/start",
         data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
         method="POST",
     )
     last_exc: Exception | None = None
@@ -329,10 +347,15 @@ PROVIDER_BASE_URLS: dict[str, str] = {
 def target_for_request(path: str, body: dict[str, Any], catalog: dict[str, Any]) -> str:
     """Resolve the upstream ``X-Target-URL`` for a passthrough request.
 
-    ``/v1/messages`` is Anthropic-native and always targets the Anthropic
-    host.  ``/v1/chat/completions`` is OpenAI-native; the provider is
-    inferred from the request's ``model`` field via the catalog, defaulting
-    to OpenAI.  Any other path defaults to Anthropic.
+    Routing by path + model:
+
+    - ``/v1/messages`` is Anthropic-native → always targets the Anthropic host.
+    - ``/v1/chat/completions`` and ``/v1/responses`` are OpenAI-native; the
+      provider is inferred from the request's ``model`` field via the
+      catalog, defaulting to OpenAI.  ``/v1/responses`` is the modern
+      stateful Responses endpoint (reasoning models, background mode,
+      polling) and routes to the same upstream hosts as chat/completions.
+    - Any other path defaults to Anthropic.
     """
     if path.endswith("/messages"):
         return PROVIDER_BASE_URLS["anthropic"]
@@ -494,7 +517,9 @@ class AdalCloudChannel(BaseChannel):
         cached_sid = load_cached_session()
         self._proxy_sid = cached_sid or f"sub2api-{uuid.uuid4().hex[:12]}"
         try:
-            await asyncio.to_thread(register_session, token=token, session_id=self._proxy_sid)
+            await asyncio.to_thread(
+                register_session, token=token, session_id=self._proxy_sid
+            )
             self._registered.add(self._proxy_sid)
             save_cached_session(self._proxy_sid)
         except AuthError:
@@ -560,9 +585,13 @@ class AdalCloudChannel(BaseChannel):
         }
         full_text: list[str] = []
         try:
-            async with self._client.stream("POST", url, json=body, headers=headers) as resp:
+            async with self._client.stream(
+                "POST", url, json=body, headers=headers
+            ) as resp:
                 if resp.status_code != 200:
-                    detail = (await resp.aread()).decode("utf-8", errors="replace")[:500]
+                    detail = (await resp.aread()).decode("utf-8", errors="replace")[
+                        :500
+                    ]
                     raise UpstreamError(f"proxy HTTP {resp.status_code}: {detail}")
                 parser = parse_anthropic_sse if is_anthropic else parse_openai_sse
                 async for line in resp.aiter_lines():
@@ -595,6 +624,7 @@ class AdalCloudChannel(BaseChannel):
         """
         if not getattr(self, "_proxy_sid", None):
             import uuid
+
             self._proxy_sid = f"sub2api-{uuid.uuid4().hex[:12]}"
             try:
                 await self._ensure_registered(self._proxy_sid)
@@ -603,7 +633,9 @@ class AdalCloudChannel(BaseChannel):
                 pass  # proxy will upsert on first request
         return self._proxy_sid
 
-    def proxy_headers(self, session_id: str, target_url: str, provider: str = "") -> dict[str, str]:
+    def proxy_headers(
+        self, session_id: str, target_url: str, provider: str = ""
+    ) -> dict[str, str]:
         """Headers to forward to ``api.adal.sylph.ai/proxy/*``.
 
         Mirrors the header set that ``adal-backend``'s ``init_proxy_client``
@@ -668,7 +700,11 @@ class AdalCloudChannel(BaseChannel):
             changed = True
         # 2. max_tokens -> max_completion_tokens for OpenAI-native models
         provider = provider_for_model(self._catalog, model)
-        if provider == "openai" and "max_tokens" in body and "max_completion_tokens" not in body:
+        if (
+            provider == "openai"
+            and "max_tokens" in body
+            and "max_completion_tokens" not in body
+        ):
             body["max_completion_tokens"] = body.pop("max_tokens")
             changed = True
         if changed:

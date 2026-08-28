@@ -61,7 +61,9 @@ class CompletionBody(BaseModel):
     reasoning_effort: str | None = None  # OpenAI-compat alias for thinking_effort
 
 
-def error_response(status_code: int, code: str, message: str, **extra: Any) -> JSONResponse:
+def error_response(
+    status_code: int, code: str, message: str, **extra: Any
+) -> JSONResponse:
     payload: dict[str, Any] = {"error": {"code": code, "message": message}}
     payload["error"].update(extra)
     return JSONResponse(status_code=status_code, content=payload)
@@ -81,6 +83,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         await channel.start()
         yield
         await channel.close()
+
     app = FastAPI(
         title="sub2api",
         description="Subscription-to-API gateway with pluggable agent channels.",
@@ -101,11 +104,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if provided != f"Bearer {expected}":
             return JSONResponse(
                 status_code=401,
-                content=oai.openai_error("invalid api key", err_type="authentication_error"),
+                content=oai.openai_error(
+                    "invalid api key", err_type="authentication_error"
+                ),
             )
         return None
 
-    def effective_tools(request_tools: list[str] | tuple[str, ...] | None) -> tuple[str, ...] | None:
+    def effective_tools(
+        request_tools: list[str] | tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
         if request_tools:
             return tuple(request_tools)
         return settings.enabled_tools
@@ -153,7 +160,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if isinstance(terminal, TurnCompleted):
             store.adopt_native(session, terminal.session_id, terminal.model)
         elif terminal is None or terminal.type == "turn.failed":
-            detail = terminal.message if terminal else "stream ended without a terminal event"
+            detail = (
+                terminal.message
+                if terminal
+                else "stream ended without a terminal event"
+            )
             code = terminal.code if terminal else "internal_error"
             return error_response(502, code, detail, session_id=session.id)
         return {
@@ -186,13 +197,19 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     def default_model() -> str:
         return channel.models[0] if channel.models else "default"
 
-    async def completion_stream(chat_request: ChatRequest, created: int) -> AsyncIterator[str]:
+    async def completion_stream(
+        chat_request: ChatRequest, created: int
+    ) -> AsyncIterator[str]:
         cid = oai.completion_id()
         model = chat_request.model or default_model()
 
         def frame(delta: dict[str, Any], finish_reason: str | None = None) -> str:
             payload = oai.build_chunk(
-                id=cid, created=created, model=model, delta=delta, finish_reason=finish_reason
+                id=cid,
+                created=created,
+                model=model,
+                delta=delta,
+                finish_reason=finish_reason,
             )
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -213,7 +230,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 payload = oai.build_chunk(
                     id=cid, created=created, model=model, delta={}, finish_reason="stop"
                 )
-                payload["error"] = {"message": event.message, "type": err_type, "code": event.code}
+                payload["error"] = {
+                    "message": event.message,
+                    "type": err_type,
+                    "code": event.code,
+                }
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 break
         yield "data: [DONE]\n\n"
@@ -231,23 +252,35 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             body_dict = json.loads(raw) if raw else {}
             target = channel.resolve_target("/v1/chat/completions", body_dict)
             sid = await channel.proxy_session_id()
-            headers = channel.proxy_headers(sid, target, channel.resolve_provider(body_dict))
+            headers = channel.proxy_headers(
+                sid, target, channel.resolve_provider(body_dict)
+            )
             url = f"{channel.proxy_url}/proxy/v1/chat/completions"
             fwd_body = channel.rewrite_body(raw)
             client = channel._client
             assert client is not None
             if body.stream:
+
                 async def fwd_openai() -> AsyncIterator[bytes]:
-                    async with client.stream("POST", url, content=fwd_body, headers=headers) as resp:
+                    async with client.stream(
+                        "POST", url, content=fwd_body, headers=headers
+                    ) as resp:
                         async for chunk in resp.aiter_raw():
                             yield chunk
+
                 return StreamingResponse(fwd_openai(), media_type="text/event-stream")
             # Non-streaming: use a dedicated request with a short read timeout
             # so upstream errors (403/502) return fast instead of hanging.
-            resp = await client.post(url, content=fwd_body, headers=headers,
-                                     timeout=httpx.Timeout(300.0, connect=15.0, read=60.0))
-            return JSONResponse(status_code=resp.status_code,
-                                content=resp.json() if resp.content else {})
+            resp = await client.post(
+                url,
+                content=fwd_body,
+                headers=headers,
+                timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
+            )
+            return JSONResponse(
+                status_code=resp.status_code,
+                content=resp.json() if resp.content else {},
+            )
         chat_request = ChatRequest(
             prompt=oai.messages_to_prompt([m.model_dump() for m in body.messages]),
             session_id=None,
@@ -263,15 +296,22 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         answer, terminal = await collect_answer(channel.chat(chat_request))
         if terminal is None or isinstance(terminal, TurnFailed):
             code = terminal.code if terminal else "internal_error"
-            message = terminal.message if terminal else "stream ended without a terminal event"
+            message = (
+                terminal.message
+                if terminal
+                else "stream ended without a terminal event"
+            )
             status, err_type = oai.error_status_and_type(code)
             return JSONResponse(
-                status_code=status, content=oai.openai_error(message, err_type=err_type, code=code)
+                status_code=status,
+                content=oai.openai_error(message, err_type=err_type, code=code),
             )
         return oai.build_completion(
             id=oai.completion_id(),
             created=created,
-            model=getattr(terminal, "model", None) or chat_request.model or default_model(),
+            model=getattr(terminal, "model", None)
+            or chat_request.model
+            or default_model(),
             content=answer,
         )
 
@@ -295,7 +335,16 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     # protocol end-to-end with zero loss (tools, usage, multi-turn all pass).
 
     def channel_supports_passthrough() -> bool:
-        return all(hasattr(channel, m) for m in ("proxy_session_id", "proxy_headers", "resolve_target", "resolve_provider", "rewrite_body"))
+        return all(
+            hasattr(channel, m)
+            for m in (
+                "proxy_session_id",
+                "proxy_headers",
+                "resolve_target",
+                "resolve_provider",
+                "rewrite_body",
+            )
+        )
 
     @app.post("/v1/messages")
     async def messages_passthrough(request: Request):
@@ -308,7 +357,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 status_code=501,
                 content=oai.openai_error(
                     f"channel `{channel.name}` has no native passthrough",
-                    err_type="api_error", code="channel_not_supported",
+                    err_type="api_error",
+                    code="channel_not_supported",
                 ),
             )
         raw = await request.body()
@@ -317,7 +367,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         except json.JSONDecodeError:
             return JSONResponse(
                 status_code=400,
-                content=oai.openai_error("invalid JSON body", err_type="invalid_request_error", code="bad_request"),
+                content=oai.openai_error(
+                    "invalid JSON body",
+                    err_type="invalid_request_error",
+                    code="bad_request",
+                ),
             )
         target = channel.resolve_target("/v1/messages", body)
         sid = await channel.proxy_session_id()
@@ -325,19 +379,157 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         stream = bool(body.get("stream"))
         url = channel.proxy_url + "/proxy/v1/messages"
         if not url:
-            return JSONResponse(status_code=501, content=oai.openai_error("proxy url missing", err_type="api_error"))
+            return JSONResponse(
+                status_code=501,
+                content=oai.openai_error("proxy url missing", err_type="api_error"),
+            )
         fwd_body = channel.rewrite_body(raw)
         client = channel._client
         assert client is not None
         if stream:
+
             async def fwd() -> AsyncIterator[bytes]:
-                async with client.stream("POST", url, content=fwd_body, headers=headers) as resp:
+                async with client.stream(
+                    "POST", url, content=fwd_body, headers=headers
+                ) as resp:
                     async for chunk in resp.aiter_raw():
                         yield chunk
-        resp = await client.post(url, content=fwd_body, headers=headers,
-                                 timeout=httpx.Timeout(300.0, connect=15.0, read=60.0))
-        return JSONResponse(status_code=resp.status_code,
-                            content=resp.json() if resp.content else {})
+
+        resp = await client.post(
+            url,
+            content=fwd_body,
+            headers=headers,
+            timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
+        )
+        return JSONResponse(
+            status_code=resp.status_code, content=resp.json() if resp.content else {}
+        )
+
+    @app.post("/v1/responses")
+    async def responses_passthrough(request: Request):
+        """OpenAI Responses API passthrough to the cloud proxy.
+
+        The Responses API is OpenAI's modern, stateful endpoint for reasoning
+        models and agentic workloads.  When the active channel is a transparent
+        cloud proxy (e.g. adal-cloud), forward the client's request verbatim to
+        the proxy's ``/proxy/v1/responses`` path — ``input``, ``tools``,
+        ``reasoning``, ``background`` mode, streaming events
+        (``response.created`` … ``response.completed``) all pass through
+        unchanged.  The proxy keeps the ``/v1/...`` suffix from the inbound
+        path and sets ``X-Target-URL`` to the upstream OpenAI host.
+        """
+        denial = unauthorized(request)
+        if denial is not None:
+            return denial
+        if not channel_supports_passthrough():
+            return JSONResponse(
+                status_code=501,
+                content=oai.openai_error(
+                    f"channel `{channel.name}` has no native passthrough",
+                    err_type="api_error",
+                    code="channel_not_supported",
+                ),
+            )
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return JSONResponse(
+                status_code=400,
+                content=oai.openai_error(
+                    "invalid JSON body",
+                    err_type="invalid_request_error",
+                    code="bad_request",
+                ),
+            )
+        target = channel.resolve_target("/v1/responses", body)
+        sid = await channel.proxy_session_id()
+        headers = channel.proxy_headers(sid, target, channel.resolve_provider(body))
+        stream = bool(body.get("stream"))
+        url = f"{channel.proxy_url}/proxy/v1/responses"
+        fwd_body = channel.rewrite_body(raw)
+        client = channel._client
+        assert client is not None
+        if stream:
+
+            async def fwd_responses() -> AsyncIterator[bytes]:
+                async with client.stream(
+                    "POST", url, content=fwd_body, headers=headers
+                ) as resp:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+
+            return StreamingResponse(fwd_responses(), media_type="text/event-stream")
+        resp = await client.post(
+            url,
+            content=fwd_body,
+            headers=headers,
+            timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
+        )
+        return JSONResponse(
+            status_code=resp.status_code, content=resp.json() if resp.content else {}
+        )
+
+    @app.get("/v1/responses/{response_id}")
+    async def responses_get(response_id: str, request: Request):
+        """Retrieve a previously created Responses API object."""
+        denial = unauthorized(request)
+        if denial is not None:
+            return denial
+        if not channel_supports_passthrough():
+            return JSONResponse(
+                status_code=501,
+                content=oai.openai_error(
+                    f"channel `{channel.name}` has no native passthrough",
+                    err_type="api_error",
+                    code="channel_not_supported",
+                ),
+            )
+        target = channel.resolve_target("/v1/responses", {})
+        sid = await channel.proxy_session_id()
+        headers = channel.proxy_headers(sid, target, "")
+        url = f"{channel.proxy_url}/proxy/v1/responses/{response_id}"
+        client = channel._client
+        assert client is not None
+        resp = await client.get(
+            url, headers=headers, timeout=httpx.Timeout(60.0, connect=15.0, read=30.0)
+        )
+        return JSONResponse(
+            status_code=resp.status_code, content=resp.json() if resp.content else {}
+        )
+
+    @app.delete("/v1/responses/{response_id}")
+    async def responses_delete(response_id: str, request: Request):
+        """Delete a stored Responses API object."""
+        denial = unauthorized(request)
+        if denial is not None:
+            return denial
+        if not channel_supports_passthrough():
+            return JSONResponse(
+                status_code=501,
+                content=oai.openai_error(
+                    f"channel `{channel.name}` has no native passthrough",
+                    err_type="api_error",
+                    code="channel_not_supported",
+                ),
+            )
+        target = channel.resolve_target("/v1/responses", {})
+        sid = await channel.proxy_session_id()
+        headers = channel.proxy_headers(sid, target, "")
+        url = f"{channel.proxy_url}/proxy/v1/responses/{response_id}"
+        client = channel._client
+        assert client is not None
+        resp = await client.delete(
+            url, headers=headers, timeout=httpx.Timeout(60.0, connect=15.0, read=30.0)
+        )
+        return JSONResponse(
+            status_code=resp.status_code, content=resp.json() if resp.content else {}
+        )
+
+    @app.post("/v1/v1/responses")
+    async def responses_passthrough_v1v1(request: Request):
+        """Compat alias for clients whose base-url includes /v1 twice."""
+        return await responses_passthrough(request)
 
     @app.post("/v1/v1/messages")
     async def messages_passthrough_v1v1(request: Request):

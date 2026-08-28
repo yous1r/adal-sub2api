@@ -55,7 +55,10 @@ def test_error_status_mapping():
 def test_completion_shapes():
     completion = build_completion(id="chatcmpl-x", created=1, model="m", content="ans")
     assert completion["object"] == "chat.completion"
-    assert completion["choices"][0]["message"] == {"role": "assistant", "content": "ans"}
+    assert completion["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "ans",
+    }
     chunk = build_chunk(id="chatcmpl-x", created=1, model="m", delta={"content": "a"})
     assert chunk["object"] == "chat.completion.chunk"
     assert chunk["choices"][0]["delta"] == {"content": "a"}
@@ -68,7 +71,10 @@ def test_completion_shapes():
 async def test_chat_completions_sync(client):
     resp = await client.post(
         "/v1/chat/completions",
-        json={"model": "echo-mini", "messages": [{"role": "user", "content": "openai hello"}]},
+        json={
+            "model": "echo-mini",
+            "messages": [{"role": "user", "content": "openai hello"}],
+        },
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -94,7 +100,9 @@ async def test_chat_completions_uses_full_history(client):
     )
     data = resp.json()
     # echo channel returns the flattened transcript verbatim
-    assert data["choices"][0]["message"]["content"] == "[SYSTEM]\nsys\n\n[USER]\nquestion"
+    assert (
+        data["choices"][0]["message"]["content"] == "[SYSTEM]\nsys\n\n[USER]\nquestion"
+    )
 
 
 @pytest.mark.anyio
@@ -159,7 +167,9 @@ async def secured_client():
     )
     app = create_app(settings)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as c:
         yield c
 
 
@@ -200,3 +210,56 @@ async def test_correct_api_key_accepted(secured_client):
 async def test_healthz_stays_open_without_auth(secured_client):
     resp = await secured_client.get("/healthz")
     assert resp.status_code == 200
+
+
+# --- /v1/responses passthrough -------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_responses_passthrough_501_without_cloud_channel(client):
+    """Echo channel has no passthrough → /v1/responses returns 501."""
+    resp = await client.post(
+        "/v1/responses",
+        json={"model": "echo-mini", "input": "hi"},
+    )
+    assert resp.status_code == 501
+    assert resp.json()["error"]["code"] == "channel_not_supported"
+
+
+@pytest.mark.anyio
+async def test_responses_get_501_without_cloud_channel(client):
+    resp = await client.get("/v1/responses/resp_123")
+    assert resp.status_code == 501
+    assert resp.json()["error"]["code"] == "channel_not_supported"
+
+
+@pytest.mark.anyio
+async def test_responses_delete_501_without_cloud_channel(client):
+    resp = await client.delete("/v1/responses/resp_123")
+    assert resp.status_code == 501
+    assert resp.json()["error"]["code"] == "channel_not_supported"
+
+
+@pytest.mark.anyio
+async def test_responses_v1v1_alias_501(client):
+    """Compat alias /v1/v1/responses also returns 501 for echo channel."""
+    resp = await client.post(
+        "/v1/v1/responses",
+        json={"model": "echo-mini", "input": "hi"},
+    )
+    assert resp.status_code == 501
+
+
+@pytest.mark.anyio
+async def test_responses_requires_api_key(secured_client):
+    resp = await secured_client.post(
+        "/v1/responses", json={"model": "echo-mini", "input": "hi"}
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["type"] == "authentication_error"
+
+
+@pytest.mark.anyio
+async def test_responses_get_requires_api_key(secured_client):
+    resp = await secured_client.get("/v1/responses/resp_123")
+    assert resp.status_code == 401

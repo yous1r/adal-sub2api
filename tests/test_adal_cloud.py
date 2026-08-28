@@ -42,19 +42,33 @@ from sub2api.core.types import ChatRequest, TextDelta, ThoughtDelta
 SAMPLE_CATALOG = {
     "default_model": "anthropic-claude-sonnet-5",
     "models": [
-        {"key": "anthropic-claude-sonnet-5", "model_id": "claude-sonnet-5",
-         "provider": "anthropic", "model_client": "AnthropicAPIClient"},
-        {"key": "openai-gpt-5.6-terra", "model_id": "gpt-5.6-terra",
-         "provider": "openai", "model_client": "OpenAIClient"},
-        {"key": "zai-glm-5.2", "model_id": "glm-5.2",
-         "provider": "zai", "model_client": "ZAIAPIClient"},
+        {
+            "key": "anthropic-claude-sonnet-5",
+            "model_id": "claude-sonnet-5",
+            "provider": "anthropic",
+            "model_client": "AnthropicAPIClient",
+        },
+        {
+            "key": "openai-gpt-5.6-terra",
+            "model_id": "gpt-5.6-terra",
+            "provider": "openai",
+            "model_client": "OpenAIClient",
+        },
+        {
+            "key": "zai-glm-5.2",
+            "model_id": "glm-5.2",
+            "provider": "zai",
+            "model_client": "ZAIAPIClient",
+        },
     ],
 }
 
 
 def test_catalog_models_extracts_keys_in_order():
     assert catalog_models(SAMPLE_CATALOG) == (
-        "anthropic-claude-sonnet-5", "openai-gpt-5.6-terra", "zai-glm-5.2",
+        "anthropic-claude-sonnet-5",
+        "openai-gpt-5.6-terra",
+        "zai-glm-5.2",
     )
 
 
@@ -66,7 +80,9 @@ def test_catalog_models_tolerates_missing_or_garbage():
 
 
 def test_provider_for_model_key_and_id():
-    assert provider_for_model(SAMPLE_CATALOG, "anthropic-claude-sonnet-5") == "anthropic"
+    assert (
+        provider_for_model(SAMPLE_CATALOG, "anthropic-claude-sonnet-5") == "anthropic"
+    )
     assert provider_for_model(SAMPLE_CATALOG, "claude-sonnet-5") == "anthropic"
     assert provider_for_model(SAMPLE_CATALOG, "openai-gpt-5.6-terra") == "openai"
     assert provider_for_model(SAMPLE_CATALOG, "unknown-model") is None
@@ -74,7 +90,10 @@ def test_provider_for_model_key_and_id():
 
 
 def test_upstream_model_id_resolves_key_to_id():
-    assert upstream_model_id(SAMPLE_CATALOG, "anthropic-claude-sonnet-5") == "claude-sonnet-5"
+    assert (
+        upstream_model_id(SAMPLE_CATALOG, "anthropic-claude-sonnet-5")
+        == "claude-sonnet-5"
+    )
     assert upstream_model_id(SAMPLE_CATALOG, "claude-sonnet-5") == "claude-sonnet-5"
     # unknown model passes through unchanged
     assert upstream_model_id(SAMPLE_CATALOG, "mystery") == "mystery"
@@ -231,10 +250,18 @@ def test_token_needs_refresh_unparseable_is_trusted():
 
 def test_fetch_catalog_stubs_network(monkeypatch):
     class FakeResp:
-        def __init__(self, body): self._body = body.encode()
-        def read(self): return self._body
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
+        def __init__(self, body):
+            self._body = body.encode()
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
     monkeypatch.setattr(
         "sub2api.channels.adal_cloud.urlopen",
         lambda req, timeout=20: FakeResp(json.dumps(SAMPLE_CATALOG)),
@@ -247,19 +274,28 @@ def test_fetch_catalog_stubs_network(monkeypatch):
 def test_fetch_catalog_returns_empty_on_network_error(monkeypatch):
     def boom(*a, **k):
         raise OSError("no net")
+
     monkeypatch.setattr("sub2api.channels.adal_cloud.urlopen", boom)
     assert fetch_catalog() == {}
 
 
 def test_register_session_posts_and_succeeds(monkeypatch):
     calls = []
+
     class FakeResp:
-        def read(self): return b'{"id":"abc"}'
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
+        def read(self):
+            return b'{"id":"abc"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
     def fake_urlopen(req, timeout=20):
         calls.append(req)
         return FakeResp()
+
     monkeypatch.setattr("sub2api.channels.adal_cloud.urlopen", fake_urlopen)
     register_session(token="tok", session_id="s1")
     assert len(calls) == 1
@@ -273,8 +309,12 @@ def test_register_session_posts_and_succeeds(monkeypatch):
 def test_register_session_raises_auth_on_http_error(monkeypatch):
     from urllib.error import HTTPError
     from io import BytesIO
+
     def fake_urlopen(req, timeout=20):
-        raise HTTPError(req.full_url, 401, "Unauthorized", {}, BytesIO(b'{"error":"x"}'))
+        raise HTTPError(
+            req.full_url, 401, "Unauthorized", {}, BytesIO(b'{"error":"x"}')
+        )
+
     monkeypatch.setattr("sub2api.channels.adal_cloud.urlopen", fake_urlopen)
     with pytest.raises(AuthError, match="HTTP 401"):
         register_session(token="tok", session_id="s1")
@@ -284,18 +324,29 @@ def test_register_session_raises_auth_on_http_error(monkeypatch):
 
 
 def test_device_flow_login_completes_on_authorized(monkeypatch, tmp_path):
-    init = {"device_code": "dc-1", "user_code": "ABCD-EFGH",
-            "verification_url": "https://adal.sylph.ai/verify", "expires_in": 600}
+    init = {
+        "device_code": "dc-1",
+        "user_code": "ABCD-EFGH",
+        "verification_url": "https://adal.sylph.ai/verify",
+        "expires_in": 600,
+    }
     pending_seen = []
+
     def fake_initiate(app_url=ADAL_APP_URL, timeout=15.0):
         return init
+
     def fake_poll(device_code, app_url=ADAL_APP_URL, timeout=15.0):
         return {"status": "authorized", "token": "fresh-tok"}
-    monkeypatch.setattr("sub2api.channels.adal_cloud.initiate_device_flow", fake_initiate)
+
+    monkeypatch.setattr(
+        "sub2api.channels.adal_cloud.initiate_device_flow", fake_initiate
+    )
     monkeypatch.setattr("sub2api.channels.adal_cloud.poll_device_flow", fake_poll)
     monkeypatch.setattr("sub2api.channels.adal_cloud.time.sleep", lambda s: None)
     creds = tmp_path / "creds.json"
-    tok = device_flow_login(on_pending=lambda r: pending_seen.append(r), creds_path=creds)
+    tok = device_flow_login(
+        on_pending=lambda r: pending_seen.append(r), creds_path=creds
+    )
     assert tok == "fresh-tok"
     assert pending_seen == [init]
     saved = json.loads(creds.read_text())
@@ -303,11 +354,19 @@ def test_device_flow_login_completes_on_authorized(monkeypatch, tmp_path):
 
 
 def test_device_flow_login_raises_on_expired(monkeypatch, tmp_path):
-    monkeypatch.setattr("sub2api.channels.adal_cloud.initiate_device_flow",
-                        lambda *a, **k: {"device_code": "dc", "user_code": "x",
-                                         "verification_url": "u", "expires_in": 1})
-    monkeypatch.setattr("sub2api.channels.adal_cloud.poll_device_flow",
-                        lambda *a, **k: {"status": "expired", "token": None})
+    monkeypatch.setattr(
+        "sub2api.channels.adal_cloud.initiate_device_flow",
+        lambda *a, **k: {
+            "device_code": "dc",
+            "user_code": "x",
+            "verification_url": "u",
+            "expires_in": 1,
+        },
+    )
+    monkeypatch.setattr(
+        "sub2api.channels.adal_cloud.poll_device_flow",
+        lambda *a, **k: {"status": "expired", "token": None},
+    )
     with pytest.raises(AuthError, match="expired"):
         device_flow_login(creds_path=tmp_path / "c.json", max_attempts=1)
 
@@ -325,7 +384,9 @@ def test_adal_cloud_channel_class_attrs():
 def test_route_for_defaults_to_anthropic():
     ch = AdalCloudChannel(ChannelConfig())
     ch._catalog = SAMPLE_CATALOG
-    sub, target, model = ch._route_for(ChatRequest(prompt="hi", model="anthropic-claude-sonnet-5"))
+    sub, target, model = ch._route_for(
+        ChatRequest(prompt="hi", model="anthropic-claude-sonnet-5")
+    )
     assert sub == "/v1/messages"
     assert target == "https://api.anthropic.com"
     assert model == "claude-sonnet-5"
@@ -334,7 +395,9 @@ def test_route_for_defaults_to_anthropic():
 def test_route_for_openai():
     ch = AdalCloudChannel(ChannelConfig())
     ch._catalog = SAMPLE_CATALOG
-    sub, target, model = ch._route_for(ChatRequest(prompt="hi", model="openai-gpt-5.6-terra"))
+    sub, target, model = ch._route_for(
+        ChatRequest(prompt="hi", model="openai-gpt-5.6-terra")
+    )
     assert sub == "/v1/chat/completions"
     assert target == "https://api.openai.com"
     assert model == "gpt-5.6-terra"
@@ -343,7 +406,9 @@ def test_route_for_openai():
 def test_route_for_unknown_model_falls_back_to_anthropic():
     ch = AdalCloudChannel(ChannelConfig())
     ch._catalog = SAMPLE_CATALOG
-    sub, target, model = ch._route_for(ChatRequest(prompt="hi", model="totally-unknown"))
+    sub, target, model = ch._route_for(
+        ChatRequest(prompt="hi", model="totally-unknown")
+    )
     # unknown provider -> default anthropic routing; model passes through unchanged
     assert sub == "/v1/messages"
     assert target == "https://api.anthropic.com"
@@ -362,39 +427,95 @@ async def test_ensure_registered_dedupes_and_calls_register(monkeypatch):
     ch._token = "tok"
     ch._registered = set()
     calls = []
+
     async def fake_to_thread(func, **kw):
         # simulate asyncio.to_thread: call sync func
         calls.append(kw)
         func(**kw)
+
     monkeypatch.setattr("sub2api.channels.adal_cloud.asyncio.to_thread", fake_to_thread)
-    monkeypatch.setattr("sub2api.channels.adal_cloud.register_session", lambda **kw: None)
+    monkeypatch.setattr(
+        "sub2api.channels.adal_cloud.register_session", lambda **kw: None
+    )
     await ch._ensure_registered("s1")
     await ch._ensure_registered("s1")  # already registered: no second call
     assert len(calls) == 1
     assert calls[0]["session_id"] == "s1"
+
 
 # -- passthrough routing ------------------------------------------------
 
 
 def test_target_for_request_messages_always_anthropic():
     # /v1/messages always targets Anthropic, regardless of model
-    assert target_for_request("/v1/messages", {"model": "anything"}, SAMPLE_CATALOG) \
+    assert (
+        target_for_request("/v1/messages", {"model": "anything"}, SAMPLE_CATALOG)
         == PROVIDER_BASE_URLS["anthropic"]
+    )
 
 
 def test_target_for_request_chat_completions_by_provider():
-    assert target_for_request("/v1/chat/completions", {"model": "openai-gpt-5.6-terra"}, SAMPLE_CATALOG) \
+    assert (
+        target_for_request(
+            "/v1/chat/completions", {"model": "openai-gpt-5.6-terra"}, SAMPLE_CATALOG
+        )
         == PROVIDER_BASE_URLS["openai"]
-    assert target_for_request("/v1/chat/completions", {"model": "zai-glm-5.2"}, SAMPLE_CATALOG) \
+    )
+    assert (
+        target_for_request(
+            "/v1/chat/completions", {"model": "zai-glm-5.2"}, SAMPLE_CATALOG
+        )
         == PROVIDER_BASE_URLS["zai"]
-    assert target_for_request("/v1/chat/completions", {"model": "gpt-5.6-terra"}, SAMPLE_CATALOG) \
+    )
+    assert (
+        target_for_request(
+            "/v1/chat/completions", {"model": "gpt-5.6-terra"}, SAMPLE_CATALOG
+        )
         == PROVIDER_BASE_URLS["openai"]
+    )
 
 
 def test_target_for_request_chat_completions_defaults_to_openai():
     # unknown model, no catalog -> openai default
-    assert target_for_request("/v1/chat/completions", {"model": "mystery"}, {}) \
+    assert (
+        target_for_request("/v1/chat/completions", {"model": "mystery"}, {})
         == PROVIDER_BASE_URLS["openai"]
+    )
+
+
+def test_target_for_request_responses_routes_like_chat_completions():
+    # /v1/responses uses the same provider routing as /v1/chat/completions
+    assert (
+        target_for_request(
+            "/v1/responses", {"model": "openai-gpt-5.6-terra"}, SAMPLE_CATALOG
+        )
+        == PROVIDER_BASE_URLS["openai"]
+    )
+    assert (
+        target_for_request("/v1/responses", {"model": "zai-glm-5.2"}, SAMPLE_CATALOG)
+        == PROVIDER_BASE_URLS["zai"]
+    )
+    assert (
+        target_for_request("/v1/responses", {"model": "gpt-5.6-terra"}, SAMPLE_CATALOG)
+        == PROVIDER_BASE_URLS["openai"]
+    )
+
+
+def test_target_for_request_responses_defaults_to_openai():
+    # unknown model, no catalog -> openai default (same as chat/completions)
+    assert (
+        target_for_request("/v1/responses", {"model": "mystery"}, {})
+        == PROVIDER_BASE_URLS["openai"]
+    )
+
+
+def test_resolve_target_delegates_responses():
+    ch = AdalCloudChannel(ChannelConfig())
+    ch._catalog = SAMPLE_CATALOG
+    assert (
+        ch.resolve_target("/v1/responses", {"model": "openai-gpt-5.6-terra"})
+        == "https://api.openai.com"
+    )
 
 
 def test_channel_proxy_headers_include_session_and_target():
@@ -410,8 +531,14 @@ def test_channel_proxy_headers_include_session_and_target():
 def test_channel_resolve_target_delegates_to_helper():
     ch = AdalCloudChannel(ChannelConfig())
     ch._catalog = SAMPLE_CATALOG
-    assert ch.resolve_target("/v1/messages", {"model": "claude-sonnet-5"}) == "https://api.anthropic.com"
-    assert ch.resolve_target("/v1/chat/completions", {"model": "openai-gpt-5.6-terra"}) == "https://api.openai.com"
+    assert (
+        ch.resolve_target("/v1/messages", {"model": "claude-sonnet-5"})
+        == "https://api.anthropic.com"
+    )
+    assert (
+        ch.resolve_target("/v1/chat/completions", {"model": "openai-gpt-5.6-terra"})
+        == "https://api.openai.com"
+    )
 
 
 @pytest.mark.anyio
@@ -420,11 +547,15 @@ async def test_proxy_session_id_registers_once_and_reuses(monkeypatch):
     ch._token = "tok"
     ch._registered = set()
     calls = []
+
     async def fake_to_thread(func, **kw):
         calls.append(kw["session_id"])
         func(**kw)
+
     monkeypatch.setattr("sub2api.channels.adal_cloud.asyncio.to_thread", fake_to_thread)
-    monkeypatch.setattr("sub2api.channels.adal_cloud.register_session", lambda **kw: None)
+    monkeypatch.setattr(
+        "sub2api.channels.adal_cloud.register_session", lambda **kw: None
+    )
     sid1 = await ch.proxy_session_id()
     sid2 = await ch.proxy_session_id()
     assert sid1 == sid2 and sid1.startswith("sub2api-")

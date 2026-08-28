@@ -57,6 +57,9 @@ SUB2API_CHANNEL=adal-cli python -m sub2api
 | 端点 | 说明 |
 |---|---|
 | `POST /v1/chat/completions` | 兼容 `messages` / `model` / `stream`；`stream: true` 时输出 `chat.completion.chunk` SSE，以 `data: [DONE]` 结束 |
+| `POST /v1/responses` | OpenAI Responses API（`adal-cloud` 透传）：`input` / `model` / `stream` / `reasoning` / `background` 原样透传，SSE 事件 `response.created` → `response.completed` |
+| `GET /v1/responses/{id}` | 获取/轮询已创建的 response 对象（后台推理模式） |
+| `DELETE /v1/responses/{id}` | 删除已存储的 response 对象 |
 | `GET /v1/models` | OpenAI 格式模型列表（来自当前渠道的 `models` 声明） |
 
 ```bash
@@ -80,6 +83,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 |---|---|---|
 | `POST /v1/messages` | Anthropic Messages API | `api.adal.sylph.ai/proxy/v1/messages`（X-Target-URL=api.anthropic.com） |
 | `POST /v1/chat/completions` | OpenAI Chat Completions | `api.adal.sylph.ai/proxy/v1/chat/completions`（X-Target-URL 按 model 推断，默认 OpenAI） |
+| `POST /v1/responses` | OpenAI Responses API | `api.adal.sylph.ai/proxy/v1/responses`（X-Target-URL 按 model 推断，默认 OpenAI） |
+| `GET /v1/responses/{id}` | OpenAI Responses API | 轮询/获取已创建的 response 对象 |
+| `DELETE /v1/responses/{id}` | OpenAI Responses API | 删除已存储的 response 对象 |
 
 CLIProxyAPI（同时支持 OpenAI 和 Anthropic 上游）可直接把 sub2api 配为上游，无需 SSE 解析。Claude Code 也可直连 `/v1/messages`：
 
@@ -88,6 +94,24 @@ CLIProxyAPI（同时支持 OpenAI 和 Anthropic 上游）可直接把 sub2api �
 curl http://127.0.0.1:8080/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+```bash
+# OpenAI Responses API（现代端点，支持 reasoning/background/stream）
+curl http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer sk-sub2api-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai-gpt-5.6-sol","input":"Plan a 3-day Tokyo itinerary.","stream":false}'
+
+# 流式：SSE 事件 response.created → response.output_text.delta → response.completed
+curl http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer sk-sub2api-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai-gpt-5.6-sol","input":"count 1 2 3","stream":true}'
+
+# 轮询已创建的 response（后台推理模式）
+curl http://127.0.0.1:8080/v1/responses/resp_abc123 \
+  -H "Authorization: Bearer sk-sub2api-secret"
 ```
 
 **注**：归一化事件层（`text.delta`/`thought.delta`/`tool.*`）仅对 `echo`/`adal-cli`/`adal-sdk`/`adal-backend` 等需要翻译的渠道生效；`adal-cloud` 走透传路径时不经过该层。
