@@ -767,6 +767,26 @@ class AdalCloudChannel(BaseChannel):
         ):
             body["max_completion_tokens"] = body.pop("max_tokens")
             changed = True
+        # 3. Remap Claude Code special tool types to "custom" — the upstream
+        # AdaL proxy rejects text_editor_20250429 / bash_20250124 as unsupported
+        # tool types.  These are Anthropic-native server tool types that the
+        # proxy doesn't implement; remapping to "custom" with the same name
+        # and an input_schema lets the model still use them as function calls.
+        tools = body.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                t = tool.get("type", "")
+                if t in ("text_editor_20250429", "bash_20250124"):
+                    tool["type"] = "custom"
+                    if "input_schema" not in tool:
+                        tool["input_schema"] = {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": True,
+                        }
+                    changed = True
         if changed:
             return json.dumps(body).encode()
         return raw
