@@ -277,6 +277,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if body.stream:
 
                 async def fwd_openai() -> AsyncIterator[bytes]:
+                    ok = True
                     try:
                         async with client.stream(
                             "POST", url, content=fwd_body, headers=headers
@@ -284,9 +285,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                             async for chunk in resp.aiter_raw():
                                 yield chunk
                     except Exception:
-                        await channel.release_slot(slot, success=False)
+                        ok = False
                         raise
-                    await channel.release_slot(slot, success=True)
+                    finally:
+                        await channel.release_slot(slot, success=ok)
 
                 return StreamingResponse(fwd_openai(), media_type="text/event-stream")
             # Non-streaming: use a dedicated request with a short read timeout
@@ -388,6 +390,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ),
             )
         raw = await request.body()
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return JSONResponse(
+                status_code=400,
+                content=oai.openai_error(
+                    "invalid JSON body",
+                    err_type="invalid_request_error",
+                    code="bad_request",
+                ),
+            )
         target = channel.resolve_target("/v1/messages", body)
         slot, sid = await channel.acquire_slot()
         headers = channel.proxy_headers(
@@ -407,6 +420,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if stream:
 
             async def fwd() -> AsyncIterator[bytes]:
+                ok = True
                 try:
                     async with client.stream(
                         "POST", url, content=fwd_body, headers=headers
@@ -414,9 +428,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         async for chunk in resp.aiter_raw():
                             yield chunk
                 except Exception:
-                    await channel.release_slot(slot, success=False)
+                    ok = False
                     raise
-                await channel.release_slot(slot, success=True)
+                finally:
+                    await channel.release_slot(slot, success=ok)
 
             return StreamingResponse(fwd(), media_type="text/event-stream")
         try:
@@ -484,6 +499,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if stream:
 
             async def fwd_responses() -> AsyncIterator[bytes]:
+                ok = True
                 try:
                     async with client.stream(
                         "POST", url, content=fwd_body, headers=headers
@@ -491,9 +507,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         async for chunk in resp.aiter_raw():
                             yield chunk
                 except Exception:
-                    await channel.release_slot(slot, success=False)
+                    ok = False
                     raise
-                await channel.release_slot(slot, success=True)
+                finally:
+                    await channel.release_slot(slot, success=ok)
 
             return StreamingResponse(fwd_responses(), media_type="text/event-stream")
         try:
