@@ -452,6 +452,40 @@ def parse_openai_sse(raw: str) -> list[Event]:
     return events
 
 
+# -- prompt cache helpers ----------------------------------------------------
+
+
+def _has_cache_control(system: Any) -> bool:
+    """True when *system* already carries ``cache_control`` somewhere."""
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and "cache_control" in block:
+                return True
+    elif isinstance(system, dict):
+        return "cache_control" in system
+    elif isinstance(system, str):
+        # Plain string system — no cache_control possible.
+        pass
+    return False
+
+
+def _inject_cache_control(system: Any) -> None:
+    """Inject ``cache_control: {type:"ephemeral"}`` on the last block of
+    *system* in place.  Handles string, dict, and list-of-dicts formats.
+    """
+    ephemeral: dict[str, str] = {"type": "ephemeral"}
+    if isinstance(system, str):
+        # Can't mutate a string; caller should have converted it.
+        return
+    if isinstance(system, dict):
+        system["cache_control"] = ephemeral
+        return
+    if isinstance(system, list) and system:
+        last = system[-1]
+        if isinstance(last, dict):
+            last["cache_control"] = ephemeral
+
+
 @register
 class AdalCloudChannel(BaseChannel):
     """Direct cloud-proxy channel: no ``adal`` install required.
@@ -730,15 +764,26 @@ class AdalCloudChannel(BaseChannel):
     def rewrite_body(self, raw: bytes) -> bytes:
         """Rewrite a passthrough request body for the upstream proxy.
 
-        Applies two compatibility rewrites so CLIProxyAPI / legacy OpenAI
-        clients can target any catalog model without knowing the upstream's
-        parameter quirks:
+        Applies compatibility rewrites so CLIProxyAPI / Claude Code /
+        legacy OpenAI clients can target any catalog model without
+        knowing the upstream's parameter quirks:
 
         1. ``model``: catalog ``key`` → upstream ``model_id``
            (e.g. ``openai-gpt-5.6-terra`` → ``gpt-5.6-terra``).
         2. ``max_tokens`` → ``max_completion_tokens`` for OpenAI-native
            models that reject the legacy parameter
            (gpt-5.6-* etc.); Anthropic models keep ``max_tokens``.
+        3. Claude Code special tool types (``text_editor_20250429``,
+           ``bash_20250124``) → ``custom`` with an ``input_schema``.
+        4. **Anthropic prompt cache**: inject ``cache_control:
+           {type:"ephemeral"}`` on the system prompt's last block when
+           the client didn't send any — this lets non-Anthropic-native
+           clients (CLIProxyAPI, raw curl) benefit from the upstream's
+           prompt caching.  Claude Code already injects its own
+           ``cache_control`` so this is idempotent.
+        5. **OpenAI prompt cache**: inject ``prompt_cache_key`` when
+           missing on Responses API requests so the upstream's prefix
+           cache is keyed consistently across retries.
 
         All other client fields pass through verbatim.  Returns the
         original bytes unchanged if nothing was rewritten.
@@ -787,6 +832,27 @@ class AdalCloudChannel(BaseChannel):
                             "additionalProperties": True,
                         }
                     changed = True
+        # 4. Anthropic prompt cache: inject cache_control on system prompt
+        # if no cache_control exists anywhere in the system field.  This
+        # maximises cache hits for clients that don't natively emit
+        # cache_control (CLIProxyAPI, raw curl).  Claude Code already adds
+        # its own cache_control so this is a no-op for it.
+        if provider == "anthropic" or (not provider and "messages" in body):
+            system = body.get("system")
+            if system is not None and not _has_cache_control(system):
+                if isinstance(system, str):
+                    # Convert plain string to content-block array so we
+                    # can attach cache_control to the last block.
+                    system = [{"type": "text", "text": system}]
+                    body["system"] = system
+                _inject_cache_control(system)
+                changed = True
+        # 5. OpenAI prompt cache: inject prompt_cache_key on Responses API
+        # requests that don't have one, so the upstream prefix cache keys
+        # consistently across retries with the same model+input.
+        if provider == "openai" and "input" in body and "prompt_cache_key" not in body:
+            body["prompt_cache_key"] = "sub2api"
+            changed = True
         if changed:
             return json.dumps(body).encode()
         return raw
@@ -807,4 +873,9 @@ class AdalCloudChannel(BaseChannel):
             }
         else:
             base["pool"] = {"enabled": False}
+        base["prompt_cache"] = {
+            "auto_inject": True,
+            "anthropic": "cache_control:ephemeral",
+            "openai": "prompt_cache_key:sub2api",
+        }
         return base

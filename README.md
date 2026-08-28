@@ -163,6 +163,22 @@ SUB2API_CHANNEL=adal-cloud python -m sub2api
 
 未配置账号池时，自动退化为单账号模式（使用 `SUB2API_AUTH_TOKEN` 或 `~/.adal/adal_oauth_creds.json`）。池状态可通过 `/healthz` 的 `channel.pool` 字段查看。
 
+### Prompt Cache 自动注入（`adal-cloud` 渠道）
+
+sub2api 自动为透传请求注入 **prompt cache** 标记，利用上游提供商（Anthropic/OpenAI）的 prefix caching 能力节省额度。缓存由上游提供商管理（TTL 通常 5 分钟~1 小时），sub2api 仅负责注入缓存标记。
+
+| 提供商 | 注入内容 | 机制 |
+|---|---|---|
+| Anthropic | `cache_control: {type:"ephemeral"}` 注入到 `system` 最后一块 | 上游对 system prompt 做前缀缓存，命中时 `cache_read_input_tokens > 0` |
+| OpenAI Responses | `prompt_cache_key: "sub2api"` 注入到请求体 | 上游按 key 缓存前缀，命中时 `cached_tokens > 0` |
+
+**行为**：
+- 仅当客户端**未发送** `cache_control` / `prompt_cache_key` 时才注入（幂等，不影响 Claude Code 等原生支持缓存的客户端）
+- 字符串格式的 `system` 会被转换为 `[{"type":"text","text":..., "cache_control":{"type":"ephemeral"}}]`
+- 缓存命中需要 system prompt ≥ 1024 tokens（Anthropic）或 input ≥ 1024 tokens（OpenAI）
+
+`/healthz` 的 `channel.prompt_cache` 字段可查看注入状态。
+
 
 ### CLIProxyAPI 接入详细指南
 
