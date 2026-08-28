@@ -549,7 +549,7 @@ class AdalCloudChannel(BaseChannel):
             self._pool = AccountPool(pool_cfg)
             await self._pool.start()
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
+                timeout=httpx.Timeout(600.0, connect=15.0, read=600.0),
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "text/event-stream",
@@ -569,7 +569,7 @@ class AdalCloudChannel(BaseChannel):
             return
         # Single-account fallback: embed the token in the shared client.
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
+            timeout=httpx.Timeout(600.0, connect=15.0, read=600.0),
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",

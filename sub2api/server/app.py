@@ -280,7 +280,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     ok = True
                     try:
                         async with client.stream(
-                            "POST", url, content=fwd_body, headers=headers
+                            "POST",
+                            url,
+                            content=fwd_body,
+                            headers=headers,
+                            timeout=httpx.Timeout(600.0, connect=15.0, read=None),
                         ) as resp:
                             async for chunk in resp.aiter_raw():
                                 yield chunk
@@ -423,7 +427,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ok = True
                 try:
                     async with client.stream(
-                        "POST", url, content=fwd_body, headers=headers
+                        "POST",
+                        url,
+                        content=fwd_body,
+                        headers=headers,
+                        timeout=httpx.Timeout(600.0, connect=15.0, read=None),
                     ) as resp:
                         async for chunk in resp.aiter_raw():
                             yield chunk
@@ -502,7 +510,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ok = True
                 try:
                     async with client.stream(
-                        "POST", url, content=fwd_body, headers=headers
+                        "POST",
+                        url,
+                        content=fwd_body,
+                        headers=headers,
+                        timeout=httpx.Timeout(600.0, connect=15.0, read=None),
                     ) as resp:
                         async for chunk in resp.aiter_raw():
                             yield chunk
