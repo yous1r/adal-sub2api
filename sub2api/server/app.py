@@ -251,9 +251,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raw = await request.body()
             body_dict = json.loads(raw) if raw else {}
             target = channel.resolve_target("/v1/chat/completions", body_dict)
-            sid = await channel.proxy_session_id()
+            slot, sid = await channel.acquire_slot()
             headers = channel.proxy_headers(
-                sid, target, channel.resolve_provider(body_dict)
+                sid, target, channel.resolve_provider(body_dict), slot=slot
             )
             url = f"{channel.proxy_url}/proxy/v1/chat/completions"
             fwd_body = channel.rewrite_body(raw)
@@ -262,21 +262,31 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if body.stream:
 
                 async def fwd_openai() -> AsyncIterator[bytes]:
-                    async with client.stream(
-                        "POST", url, content=fwd_body, headers=headers
-                    ) as resp:
-                        async for chunk in resp.aiter_raw():
-                            yield chunk
+                    try:
+                        async with client.stream(
+                            "POST", url, content=fwd_body, headers=headers
+                        ) as resp:
+                            async for chunk in resp.aiter_raw():
+                                yield chunk
+                    except Exception:
+                        await channel.release_slot(slot, success=False)
+                        raise
+                    await channel.release_slot(slot, success=True)
 
                 return StreamingResponse(fwd_openai(), media_type="text/event-stream")
             # Non-streaming: use a dedicated request with a short read timeout
             # so upstream errors (403/502) return fast instead of hanging.
-            resp = await client.post(
-                url,
-                content=fwd_body,
-                headers=headers,
-                timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
-            )
+            try:
+                resp = await client.post(
+                    url,
+                    content=fwd_body,
+                    headers=headers,
+                    timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
+                )
+            except Exception:
+                await channel.release_slot(slot, success=False)
+                raise
+            await channel.release_slot(slot, success=resp.status_code < 500)
             return JSONResponse(
                 status_code=resp.status_code,
                 content=resp.json() if resp.content else {},
@@ -338,7 +348,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         return all(
             hasattr(channel, m)
             for m in (
-                "proxy_session_id",
+                "acquire_slot",
+                "release_slot",
                 "proxy_headers",
                 "resolve_target",
                 "resolve_provider",
@@ -362,23 +373,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ),
             )
         raw = await request.body()
-        try:
-            body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            return JSONResponse(
-                status_code=400,
-                content=oai.openai_error(
-                    "invalid JSON body",
-                    err_type="invalid_request_error",
-                    code="bad_request",
-                ),
-            )
         target = channel.resolve_target("/v1/messages", body)
-        sid = await channel.proxy_session_id()
-        headers = channel.proxy_headers(sid, target, channel.resolve_provider(body))
+        slot, sid = await channel.acquire_slot()
+        headers = channel.proxy_headers(
+            sid, target, channel.resolve_provider(body), slot=slot
+        )
         stream = bool(body.get("stream"))
         url = channel.proxy_url + "/proxy/v1/messages"
         if not url:
+            await channel.release_slot(slot)
             return JSONResponse(
                 status_code=501,
                 content=oai.openai_error("proxy url missing", err_type="api_error"),
@@ -389,18 +392,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if stream:
 
             async def fwd() -> AsyncIterator[bytes]:
-                async with client.stream(
-                    "POST", url, content=fwd_body, headers=headers
-                ) as resp:
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
+                try:
+                    async with client.stream(
+                        "POST", url, content=fwd_body, headers=headers
+                    ) as resp:
+                        async for chunk in resp.aiter_raw():
+                            yield chunk
+                except Exception:
+                    await channel.release_slot(slot, success=False)
+                    raise
+                await channel.release_slot(slot, success=True)
 
-        resp = await client.post(
-            url,
-            content=fwd_body,
-            headers=headers,
-            timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
-        )
+            return StreamingResponse(fwd(), media_type="text/event-stream")
+        try:
+            resp = await client.post(
+                url,
+                content=fwd_body,
+                headers=headers,
+                timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
+            )
+        except Exception:
+            await channel.release_slot(slot, success=False)
+            raise
+        await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
             status_code=resp.status_code, content=resp.json() if resp.content else {}
         )
@@ -443,8 +457,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ),
             )
         target = channel.resolve_target("/v1/responses", body)
-        sid = await channel.proxy_session_id()
-        headers = channel.proxy_headers(sid, target, channel.resolve_provider(body))
+        slot, sid = await channel.acquire_slot()
+        headers = channel.proxy_headers(
+            sid, target, channel.resolve_provider(body), slot=slot
+        )
         stream = bool(body.get("stream"))
         url = f"{channel.proxy_url}/proxy/v1/responses"
         fwd_body = channel.rewrite_body(raw)
@@ -453,19 +469,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if stream:
 
             async def fwd_responses() -> AsyncIterator[bytes]:
-                async with client.stream(
-                    "POST", url, content=fwd_body, headers=headers
-                ) as resp:
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
+                try:
+                    async with client.stream(
+                        "POST", url, content=fwd_body, headers=headers
+                    ) as resp:
+                        async for chunk in resp.aiter_raw():
+                            yield chunk
+                except Exception:
+                    await channel.release_slot(slot, success=False)
+                    raise
+                await channel.release_slot(slot, success=True)
 
             return StreamingResponse(fwd_responses(), media_type="text/event-stream")
-        resp = await client.post(
-            url,
-            content=fwd_body,
-            headers=headers,
-            timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
-        )
+        try:
+            resp = await client.post(
+                url,
+                content=fwd_body,
+                headers=headers,
+                timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
+            )
+        except Exception:
+            await channel.release_slot(slot, success=False)
+            raise
+        await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
             status_code=resp.status_code, content=resp.json() if resp.content else {}
         )
@@ -486,14 +512,21 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ),
             )
         target = channel.resolve_target("/v1/responses", {})
-        sid = await channel.proxy_session_id()
-        headers = channel.proxy_headers(sid, target, "")
+        slot, sid = await channel.acquire_slot()
+        headers = channel.proxy_headers(sid, target, "", slot=slot)
         url = f"{channel.proxy_url}/proxy/v1/responses/{response_id}"
         client = channel._client
         assert client is not None
-        resp = await client.get(
-            url, headers=headers, timeout=httpx.Timeout(60.0, connect=15.0, read=30.0)
-        )
+        try:
+            resp = await client.get(
+                url,
+                headers=headers,
+                timeout=httpx.Timeout(60.0, connect=15.0, read=30.0),
+            )
+        except Exception:
+            await channel.release_slot(slot, success=False)
+            raise
+        await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
             status_code=resp.status_code, content=resp.json() if resp.content else {}
         )
@@ -514,14 +547,21 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ),
             )
         target = channel.resolve_target("/v1/responses", {})
-        sid = await channel.proxy_session_id()
-        headers = channel.proxy_headers(sid, target, "")
+        slot, sid = await channel.acquire_slot()
+        headers = channel.proxy_headers(sid, target, "", slot=slot)
         url = f"{channel.proxy_url}/proxy/v1/responses/{response_id}"
         client = channel._client
         assert client is not None
-        resp = await client.delete(
-            url, headers=headers, timeout=httpx.Timeout(60.0, connect=15.0, read=30.0)
-        )
+        try:
+            resp = await client.delete(
+                url,
+                headers=headers,
+                timeout=httpx.Timeout(60.0, connect=15.0, read=30.0),
+            )
+        except Exception:
+            await channel.release_slot(slot, success=False)
+            raise
+        await channel.release_slot(slot, success=resp.status_code < 500)
         return JSONResponse(
             status_code=resp.status_code, content=resp.json() if resp.content else {}
         )

@@ -116,6 +116,54 @@ curl http://127.0.0.1:8080/v1/responses/resp_abc123 \
 
 **注**：归一化事件层（`text.delta`/`thought.delta`/`tool.*`）仅对 `echo`/`adal-cli`/`adal-sdk`/`adal-backend` 等需要翻译的渠道生效；`adal-cloud` 走透传路径时不经过该层。
 
+### 多账号池（`adal-cloud` 渠道）
+
+当拥有多个 AdaL 订阅账号时，可以配置账号池实现**高并发调度**与**资源共享**。账号池支持：
+
+- **轮询（round-robin）/ 最少连接（least-connections）**两种调度策略
+- 每账号独立**并发上限**，总并发由所有账号上限之和决定
+- **健康追踪**：连续失败达阈值后自动冷却该账号，冷却期满自动恢复
+- **故障降级**：所有账号都在冷却时 fail-open，选择最早恢复的账号
+
+#### 配置方式
+
+通过环境变量 `SUB2API_ACCOUNTS` 传入 JSON，或放置配置文件 `~/.adal/accounts.json`：
+
+```json
+{
+  "strategy": "round-robin",
+  "max_failures": 3,
+  "cooldown_seconds": 60,
+  "accounts": [
+    {"token": "<jwt-1>", "session_id": "sub2api-acct1", "max_concurrent": 4},
+    {"token": "<jwt-2>", "session_id": "sub2api-acct2", "max_concurrent": 4},
+    {"token": "<jwt-3>", "session_id": "sub2api-acct3", "max_concurrent": 2}
+  ]
+}
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `strategy` | `round-robin` | 调度策略：`round-robin` 或 `least-connections` |
+| `max_failures` | `3` | 连续失败多少次后冷却该账号 |
+| `cooldown_seconds` | `60` | 冷却时长（秒），期满自动恢复 |
+| `accounts[].token` | — | 账号的 Clerk JWT |
+| `accounts[].session_id` | 自动生成 | 代理会话 ID，留空则自动生成 |
+| `accounts[].max_concurrent` | `4` | 该账号最大并发请求数 |
+
+```bash
+# 环境变量方式
+SUB2API_ACCOUNTS='{"strategy":"round-robin","accounts":[{"token":"jwt-a"},{"token":"jwt-b"}]}' \
+  SUB2API_CHANNEL=adal-cloud python -m sub2api
+
+# 或文件方式
+echo '{"accounts":[{"token":"jwt-a"},{"token":"jwt-b"}]}' > ~/.adal/accounts.json
+SUB2API_CHANNEL=adal-cloud python -m sub2api
+```
+
+未配置账号池时，自动退化为单账号模式（使用 `SUB2API_AUTH_TOKEN` 或 `~/.adal/adal_oauth_creds.json`）。池状态可通过 `/healthz` 的 `channel.pool` 字段查看。
+
+
 ### CLIProxyAPI 接入详细指南
 
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 同时支持 OpenAI 与 Anthropic 两种上游协议，可以把 sub2api 当作一个自建上游接入，再对外统一暴露 OpenAI / Claude / Gemini 兼容端点。`adal-cloud` 渠道下 sub2api 原样透传上游响应，CLIProxyAPI 负责按客户端格式分发，**sub2api 不解析 SSE**。
@@ -446,6 +494,7 @@ SSE 帧类型：`session.started` → `thought.delta` / `text.delta` / `message.
 | `SUB2API_CHANNEL` | `echo` | 激活的渠道名 |
 | `SUB2API_HOST` / `SUB2API_PORT` | `127.0.0.1` / `8080` | 监听地址 |
 | `SUB2API_WORKSPACE` | `.` | 渠道默认工作目录 |
+| `SUB2API_ACCOUNTS` | — | JSON，多账号池配置（详见「多账号池」章节）；也可用 `~/.adal/accounts.json` |
 | `SUB2API_AUTH_TOKEN` | — | 显式 JWT（如 AdaL 的 `access_token`），CI 无浏览器时用 |
 | `SUB2API_API_KEY` | — | 设置后 `/v1/*` 全部要求 `Authorization: Bearer <key>`（`/healthz` 除外） |
 | `SUB2API_OPENAI_PERMISSION_MODE` | `yolo` | OpenAI 兼容路由使用的权限模式 |

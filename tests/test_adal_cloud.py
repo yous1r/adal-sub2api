@@ -542,10 +542,12 @@ def test_channel_resolve_target_delegates_to_helper():
 
 
 @pytest.mark.anyio
-async def test_proxy_session_id_registers_once_and_reuses(monkeypatch):
+async def test_acquire_slot_single_account_registers_once_and_reuses(monkeypatch):
     ch = AdalCloudChannel(ChannelConfig())
     ch._token = "tok"
     ch._registered = set()
+    ch._pool = None
+    ch._proxy_sid = None
     calls = []
 
     async def fake_to_thread(func, **kw):
@@ -556,12 +558,73 @@ async def test_proxy_session_id_registers_once_and_reuses(monkeypatch):
     monkeypatch.setattr(
         "sub2api.channels.adal_cloud.register_session", lambda **kw: None
     )
-    sid1 = await ch.proxy_session_id()
-    sid2 = await ch.proxy_session_id()
+    slot1, sid1 = await ch.acquire_slot()
+    slot2, sid2 = await ch.acquire_slot()
     assert sid1 == sid2 and sid1.startswith("sub2api-")
+    assert slot1 is None and slot2 is None  # single-account mode
     assert len(calls) == 1  # registered once, then cached
 
 
 def test_channel_proxy_url_class_attr():
     ch = AdalCloudChannel(ChannelConfig())
     assert ch.proxy_url == ADAL_PROXY_URL
+
+
+# -- pool integration --------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_acquire_slot_pool_mode_distributes_across_accounts(monkeypatch):
+    """When a pool is configured, acquire_slot round-robins across accounts."""
+    from sub2api.core.pool import AccountConfig, AccountPool, PoolConfig
+
+    ch = AdalCloudChannel(ChannelConfig())
+    ch._token = "fallback-tok"
+    ch._registered = set()
+    ch._proxy_sid = None
+    cfg = PoolConfig(
+        strategy="round-robin",
+        accounts=[
+            AccountConfig(token="tok-a", session_id="sess-a", max_concurrent=5),
+            AccountConfig(token="tok-b", session_id="sess-b", max_concurrent=5),
+        ],
+    )
+    ch._pool = AccountPool(cfg)
+    await ch._pool.start()
+
+    monkeypatch.setattr(
+        "sub2api.channels.adal_cloud.register_session", lambda **kw: None
+    )
+
+    results = []
+    for _ in range(4):
+        slot, sid = await ch.acquire_slot()
+        results.append((slot.session_id, slot.token))
+        await ch.release_slot(slot)
+    # Round-robin: a, b, a, b
+    assert results[0][0] == "sess-a"
+    assert results[1][0] == "sess-b"
+    assert results[2][0] == "sess-a"
+    assert results[3][0] == "sess-b"
+    await ch._pool.close()
+
+
+def test_proxy_headers_uses_slot_token_in_pool_mode():
+    """proxy_headers picks the slot's token when slot is provided."""
+    from sub2api.core.pool import AccountSlot
+
+    ch = AdalCloudChannel(ChannelConfig())
+    ch._token = "fallback-tok"
+    slot = AccountSlot(token="pool-tok", session_id="sess-x", max_concurrent=2)
+    headers = ch.proxy_headers("sess-x", "https://api.openai.com", "openai", slot=slot)
+    assert headers["Authorization"] == "Bearer pool-tok"
+    assert headers["X-Session-ID"] == "sess-x"
+    assert headers["X-Provider"] == "openai"
+
+
+def test_proxy_headers_falls_back_to_channel_token():
+    """Without a slot, proxy_headers uses the channel-level token."""
+    ch = AdalCloudChannel(ChannelConfig())
+    ch._token = "chan-tok"
+    headers = ch.proxy_headers("sess-1", "https://api.openai.com", "", slot=None)
+    assert headers["Authorization"] == "Bearer chan-tok"

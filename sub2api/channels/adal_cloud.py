@@ -47,6 +47,7 @@ import httpx
 
 from ..core.channel import BaseChannel
 from ..core.errors import AuthError, RuntimeMissingError, UpstreamError
+from ..core.pool import AccountPool, AccountSlot, load_pool_config
 from ..core.registry import register
 from ..core.types import (
     ChatRequest,
@@ -478,6 +479,8 @@ class AdalCloudChannel(BaseChannel):
     _catalog: dict[str, Any]
     _registered: set[str]
     _client: httpx.AsyncClient | None
+    _pool: AccountPool | None
+    _proxy_sid: str | None
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
@@ -485,6 +488,8 @@ class AdalCloudChannel(BaseChannel):
         self._catalog = {}
         self._registered = set()
         self._client = None
+        self._pool = None
+        self._proxy_sid = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -502,6 +507,33 @@ class AdalCloudChannel(BaseChannel):
         if not token:
             token = await asyncio.to_thread(device_flow_login)
         self._token = token
+        # Multi-account pool: when configured, the pool owns per-account tokens
+        # and sessions. The shared httpx client is token-agnostic (the
+        # Authorization header is set per-request from the acquired slot).
+        pool_cfg = await asyncio.to_thread(load_pool_config)
+        if pool_cfg is not None and pool_cfg.accounts:
+            self._pool = AccountPool(pool_cfg)
+            await self._pool.start()
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+            )
+            # Pre-register every pool session id with its own token.
+            for slot in self._pool.slots:
+                try:
+                    await asyncio.to_thread(
+                        register_session,
+                        token=slot.token,
+                        session_id=slot.session_id,
+                    )
+                    self._registered.add(slot.session_id)
+                except AuthError:
+                    pass  # proxy will upsert on first request
+            return
+        # Single-account fallback: embed the token in the shared client.
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=15.0, read=120.0),
             headers={
@@ -526,6 +558,9 @@ class AdalCloudChannel(BaseChannel):
             pass  # will retry on first request
 
     async def close(self) -> None:
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -579,10 +614,16 @@ class AdalCloudChannel(BaseChannel):
             if is_anthropic
             else openai_request(upstream_model, request)
         )
-        headers = {
+        headers: dict[str, str] = {
             "X-Session-ID": session_id,
             "X-Target-URL": target_url,
         }
+        slot: AccountSlot | None = None
+        if self._pool is not None:
+            slot = await self._pool.acquire()
+            await self._ensure_registered(slot.session_id)
+            headers["Authorization"] = f"Bearer {slot.token}"
+            headers["X-Session-ID"] = slot.session_id
         full_text: list[str] = []
         try:
             async with self._client.stream(
@@ -601,42 +642,60 @@ class AdalCloudChannel(BaseChannel):
                             full_text.append(event.text)
                         yield event
         except UpstreamError:
+            if slot is not None:
+                await self._pool.release(slot, success=False)
             raise
         except httpx.HTTPError as exc:
+            if slot is not None:
+                await self._pool.release(slot, success=False)
             raise UpstreamError(f"proxy transport error: {exc}") from exc
-
+        if slot is not None:
+            await self._pool.release(slot, success=True)
         if not full_text:
             raise UpstreamError("proxy stream ended without any text content")
 
     # -- passthrough (native format, no event normalization) ---------------
 
-    async def proxy_session_id(self) -> str:
-        """Return a registered ``X-Session-ID`` for passthrough requests.
+    async def acquire_slot(self) -> tuple[AccountSlot | None, str]:
+        """Acquire a pool slot for a passthrough request.
 
-        A single process-scoped session is pre-registered at startup (see
-        ``_start``) and reused for every request — the remote proxy is
-        stateless (conversation history lives in the client's ``messages``
-        array, not server-side), so one billing session covers all turns.
-
-        If pre-registration failed at startup, this is non-blocking: the
-        proxy upserts the session on first use anyway, so we return the id
-        immediately rather than blocking the request on a retry.
+        Returns ``(slot, session_id)``.  When the pool is active the slot
+        must be released via ``release_slot`` after the request completes
+        (use ``success=`` to report the outcome).  When no pool is configured
+        ``(None, self._proxy_sid)`` is returned and no release is needed.
         """
-        if not getattr(self, "_proxy_sid", None):
-            import uuid
-
+        if self._pool is not None:
+            slot = await self._pool.acquire()
+            await self._ensure_registered(slot.session_id)
+            return slot, slot.session_id
+        # Single-account fallback.
+        if not self._proxy_sid:
             self._proxy_sid = f"sub2api-{uuid.uuid4().hex[:12]}"
             try:
                 await self._ensure_registered(self._proxy_sid)
                 save_cached_session(self._proxy_sid)
             except AuthError:
-                pass  # proxy will upsert on first request
-        return self._proxy_sid
+                pass
+        return None, self._proxy_sid
+
+    async def release_slot(
+        self, slot: AccountSlot | None, *, success: bool = True
+    ) -> None:
+        """Release a previously acquired slot.  No-op for single-account mode."""
+        if slot is not None and self._pool is not None:
+            await self._pool.release(slot, success=success)
 
     def proxy_headers(
-        self, session_id: str, target_url: str, provider: str = ""
+        self,
+        session_id: str,
+        target_url: str,
+        provider: str = "",
+        slot: AccountSlot | None = None,
     ) -> dict[str, str]:
         """Headers to forward to ``api.adal.sylph.ai/proxy/*``.
+
+        When ``slot`` is provided (pool mode) the per-account token is used;
+        otherwise the channel-level token is used (single-account mode).
 
         Mirrors the header set that ``adal-backend``'s ``init_proxy_client``
         sends: Authorization, X-Session-ID, X-Target-URL, X-Provider, and
@@ -644,8 +703,9 @@ class AdalCloudChannel(BaseChannel):
         Values match what the ``adal`` CLI sends to ``set_context`` so the
         proxy sees a legitimate client.
         """
+        bearer = slot.token if slot is not None else self._require_token()
         headers = {
-            "Authorization": f"Bearer {self._require_token()}",
+            "Authorization": f"Bearer {bearer}",
             "Content-Type": "application/json",
             "X-Session-ID": session_id,
             "X-Target-URL": target_url,
@@ -719,4 +779,12 @@ class AdalCloudChannel(BaseChannel):
         base["token_present"] = bool(self._token)
         base["registered_sessions"] = len(self._registered)
         base["models"] = list(self.models)
+        if self._pool is not None:
+            base["pool"] = {
+                "enabled": True,
+                "size": self._pool.size,
+                "slots": self._pool.snapshot(),
+            }
+        else:
+            base["pool"] = {"enabled": False}
         return base
