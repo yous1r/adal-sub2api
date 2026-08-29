@@ -555,8 +555,11 @@ class AdalCloudChannel(BaseChannel):
                     "Accept": "text/event-stream",
                 },
             )
-            # Pre-register every pool session id with its own token.
-            for slot in self._pool.slots:
+
+            # Pre-register every pool session id with its own token. These are
+            # independent network calls, so fire them all at once; serial
+            # registration made startup take N×15s on a large pool.
+            async def _register_slot(slot):
                 try:
                     await asyncio.to_thread(
                         register_session,
@@ -566,6 +569,8 @@ class AdalCloudChannel(BaseChannel):
                     self._registered.add(slot.session_id)
                 except AuthError:
                     pass  # proxy will upsert on first request
+
+            await asyncio.gather(*(_register_slot(s) for s in self._pool.slots))
             return
         # Single-account fallback: embed the token in the shared client.
         self._client = httpx.AsyncClient(
