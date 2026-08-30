@@ -60,6 +60,9 @@ class BaseChannel(ABC):
     async def close(self) -> None:
         """Release resources. Must be idempotent."""
 
+    async def refresh(self) -> None:
+        """Refresh externally managed channel state before a request."""
+
     @property
     def started(self) -> bool:
         return self._started
@@ -84,7 +87,9 @@ class BaseChannel(ABC):
         except Sub2ApiError as exc:
             yield TurnFailed(code=exc.code, message=str(exc))
         except Exception as exc:  # boundary normalization - deliberate breadth
-            yield TurnFailed(code="internal_error", message=f"{type(exc).__name__}: {exc}")
+            yield TurnFailed(
+                code="internal_error", message=f"{type(exc).__name__}: {exc}"
+            )
 
     # -- introspection -----------------------------------------------------
 

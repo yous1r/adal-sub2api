@@ -114,6 +114,9 @@ class AccountSlot:
     fail_count: int = 0
     disabled_until: float = 0.0
     total_served: int = 0
+    # set when the account is parked for a permanent reason (banned user,
+    # dead cookies); cleared on a successful token re-mint
+    dead_reason: str = ""
 
     @property
     def is_healthy(self) -> bool:
@@ -148,13 +151,9 @@ class AccountPool:
         await pool.close()
     """
 
-    def __init__(self, config: PoolConfig) -> None:
-        if not config.accounts:
-            raise ValueError("AccountPool requires at least one account")
-        self._strategy = config.strategy
-        self._max_failures = config.max_failures
-        self._cooldown_seconds = config.cooldown_seconds
-        self._slots: list[AccountSlot] = [
+    @staticmethod
+    def _slots_from_config(config: PoolConfig) -> list[AccountSlot]:
+        return [
             AccountSlot(
                 token=a.token,
                 session_id=a.session_id or f"sub2api-pool-{i:03d}",
@@ -164,10 +163,50 @@ class AccountPool:
             )
             for i, a in enumerate(config.accounts)
         ]
+
+    def __init__(self, config: PoolConfig) -> None:
+        if not config.accounts:
+            raise ValueError("AccountPool requires at least one account")
+        self._strategy = config.strategy
+        self._max_failures = config.max_failures
+        self._cooldown_seconds = config.cooldown_seconds
+        self._slots = self._slots_from_config(config)
         self._global_sem = asyncio.Semaphore(sum(s.max_concurrent for s in self._slots))
         self._lock = asyncio.Lock()
         self._rr_index = 0
-        self._started = False
+        self._waiting = 0
+
+    async def reconfigure(self, config: PoolConfig) -> bool:
+        """Replace account definitions only when no request or waiter exists."""
+        if not config.accounts:
+            return False
+        async with self._lock:
+            if any(slot.in_flight for slot in self._slots) or self._waiting:
+                return False
+            previous = {s.session_id: s for s in self._slots}
+            self._strategy = config.strategy
+            self._max_failures = config.max_failures
+            self._cooldown_seconds = config.cooldown_seconds
+            self._slots = self._slots_from_config(config)
+            # Carry over parked-account state when the account entry itself
+            # didn't change (the registrar rewrites accounts.json with re-minted
+            # tokens whose cookies are identical; the dead reason — e.g. a
+            # banned Clerk user — still applies).  Fresh cookies mean the
+            # account may have been fixed, so allow a re-probe.
+            for slot in self._slots:
+                old = previous.get(slot.session_id)
+                if (
+                    old is not None
+                    and old.dead_reason
+                    and old.cookies == slot.cookies
+                ):
+                    slot.dead_reason = old.dead_reason
+                    slot.disabled_until = old.disabled_until
+            self._global_sem = asyncio.Semaphore(
+                sum(slot.max_concurrent for slot in self._slots)
+            )
+            self._rr_index = 0
+            return True
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -186,21 +225,45 @@ class AccountPool:
     def slots(self) -> list[AccountSlot]:
         return self._slots
 
+    @property
+    def is_idle(self) -> bool:
+        """Whether no request is active or waiting for capacity."""
+        return not self._waiting and all(slot.in_flight == 0 for slot in self._slots)
+
+    async def close_if_idle(self) -> bool:
+        """Stop the pool when no request is using or waiting for a slot."""
+        async with self._lock:
+            if self._waiting or any(slot.in_flight for slot in self._slots):
+                return False
+            self._started = False
+            return True
+
     # -- core scheduling ---------------------------------------------------
 
     async def acquire(self) -> AccountSlot:
-        """Return a healthy, non-saturated slot.
-
-        Blocks (via the global semaphore) until at least one slot has
-        capacity.  When all slots are in cooldown, picks the one whose
-        cooldown expires soonest (fail-open).
-        """
-        await self._global_sem.acquire()
+        """Return a healthy, non-saturated slot."""
         async with self._lock:
-            slot = self._pick()
-            slot.in_flight += 1
-            slot.total_served += 1
-            return slot
+            semaphore = self._global_sem
+            self._waiting += 1
+        waiting = True
+        acquired = False
+        try:
+            await semaphore.acquire()
+            acquired = True
+            async with self._lock:
+                self._waiting -= 1
+                waiting = False
+                slot = self._pick()
+                slot.in_flight += 1
+                slot.total_served += 1
+                return slot
+        except BaseException:
+            async with self._lock:
+                if waiting:
+                    self._waiting -= 1
+            if acquired:
+                semaphore.release()
+            raise
 
     async def release(self, slot: AccountSlot, *, success: bool = True) -> None:
         """Return a slot to the pool and update health."""
@@ -256,6 +319,7 @@ class AccountPool:
                 "healthy": s.is_healthy,
                 "cooldown_remaining": max(0.0, s.disabled_until - now),
                 "total_served": s.total_served,
+                "dead_reason": s.dead_reason,
             }
             for s in self._slots
         ]

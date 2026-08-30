@@ -10,7 +10,10 @@ import json
 import time
 from pathlib import Path
 
+
 import pytest
+
+from sub2api.core.pool import AccountConfig, PoolConfig
 
 from sub2api.channels.adal_cloud import (
     ADAL_APP_URL,
@@ -279,7 +282,51 @@ def test_fetch_catalog_returns_empty_on_network_error(monkeypatch):
     assert fetch_catalog() == {}
 
 
+@pytest.mark.anyio
+async def test_channel_refresh_updates_catalog_and_pool(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    channel._pool = mod.AccountPool(
+        PoolConfig(accounts=[AccountConfig(token="old", session_id="old-sid")])
+    )
+    await channel._pool.start()
+    old_cfg = PoolConfig(accounts=[AccountConfig(token="old", session_id="old-sid")])
+    new_cfg = PoolConfig(accounts=[AccountConfig(token="new", session_id="new-sid")])
+    channel._pool_signature = channel._pool_signature_for(old_cfg)
+    catalogs = iter(
+        [
+            {"models": [{"key": "model-a", "provider": "anthropic", "model_id": "a"}]},
+        ]
+    )
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: next(catalogs))
+    monkeypatch.setattr(mod, "load_pool_config", lambda: new_cfg)
+
+    await channel.refresh()
+
+    assert channel.models == ("model-a",)
+    assert channel._catalog["models"][0]["model_id"] == "a"
+    assert channel._pool.slots[0].token == "new"
+    assert channel._pool.slots[0].session_id == "new-sid"
+
+
+@pytest.mark.anyio
+async def test_channel_refresh_keeps_old_catalog_on_fetch_failure(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    channel._catalog = {"models": [{"key": "old", "provider": "anthropic"}]}
+    channel.models = ("old",)
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    await channel.refresh()
+    assert channel.models == ("old",)
+    assert channel._catalog["models"][0]["key"] == "old"
+
+
 def test_register_session_posts_and_succeeds(monkeypatch):
+
     calls = []
 
     class FakeResp:
@@ -304,6 +351,79 @@ def test_register_session_posts_and_succeeds(monkeypatch):
     body = json.loads(calls[0].data)
     assert body["session_id"] == "s1"
     assert body["client_entrypoint"] == "adal"
+
+
+@pytest.mark.anyio
+async def test_health_reflects_reloaded_pool(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    initial = PoolConfig(accounts=[AccountConfig(token="old", session_id="old-sid")])
+    channel._pool = mod.AccountPool(initial)
+    await channel._pool.start()
+    channel._pool_signature = channel._pool_signature_for(initial)
+    updated = PoolConfig(
+        accounts=[
+            AccountConfig(token="new-a", session_id="new-a-sid"),
+            AccountConfig(token="new-b", session_id="new-b-sid"),
+        ]
+    )
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: updated)
+
+    health = await channel.health()
+
+    assert health["models"] == list(channel.models)
+    assert health["pool"]["enabled"] is True
+    assert health["pool"]["size"] == 2
+    assert [slot["session_id"] for slot in health["pool"]["slots"]] == [
+        "new-a-sid",
+        "new-b-sid",
+    ]
+
+
+@pytest.mark.anyio
+async def test_health_marks_models_unavailable_when_all_accounts_cooldown(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    config = PoolConfig(
+        max_failures=1,
+        accounts=[AccountConfig(token="token", session_id="sid")],
+    )
+    channel._pool = mod.AccountPool(config)
+    await channel._pool.start()
+    channel._pool_signature = channel._pool_signature_for(config)
+    channel._pool.slots[0].disabled_until = time.monotonic() + 60
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: config)
+
+    health = await channel.health()
+
+    assert health["pool"]["healthy_accounts"] == 0
+    assert health["pool"]["available_capacity"] == 0
+    assert health["pool"]["models_available"] is False
+
+
+@pytest.mark.anyio
+async def test_health_disables_pool_after_accounts_removed(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    config = PoolConfig(accounts=[AccountConfig(token="token", session_id="sid")])
+    channel._pool = mod.AccountPool(config)
+    await channel._pool.start()
+    channel._pool_signature = channel._pool_signature_for(config)
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: None)
+
+    health = await channel.health()
+
+    assert health["pool"] == {"enabled": False}
+    assert channel._pool is None
 
 
 def test_register_session_raises_auth_on_http_error(monkeypatch):
@@ -628,3 +748,441 @@ def test_proxy_headers_falls_back_to_channel_token():
     ch._token = "chan-tok"
     headers = ch.proxy_headers("sess-1", "https://api.openai.com", "", slot=None)
     assert headers["Authorization"] == "Bearer chan-tok"
+
+
+# -- cookie mint / runtime token refresh ------------------------------------
+
+
+def _make_jwt(claims: dict) -> str:
+    import base64
+
+    def b64(d: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+
+    header = b64({"alg": "RS256", "typ": "JWT"})
+    return f"{header}.{b64(claims)}.sig"
+
+
+def _mint_resp(status_code: int = 200, payload: dict | None = None):
+    class FakeResp:
+        def __init__(self):
+            self.status_code = status_code
+
+        def json(self):
+            return payload or {}
+
+    return FakeResp()
+
+
+def test_mint_token_with_cookies_success(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    seen = {}
+
+    def fake_post(url, **kw):
+        seen["url"] = url
+        seen["cookies"] = kw.get("cookies")
+        return _mint_resp(payload={"jwt": "fresh.jwt.sig"})
+
+    monkeypatch.setattr(mod.httpx, "post", fake_post)
+    token = _make_jwt({"exp": int(time.time()) - 5, "sid": "sess_abc"})
+    fresh, err = mod.mint_token_with_cookies(
+        token,
+        [
+            {
+                "name": "__client",
+                "value": "c-val",
+                "domain": ".clerk.example",
+                "path": "/",
+            }
+        ],
+    )
+    assert err is None
+    assert fresh == "fresh.jwt.sig"
+    assert "sessions/sess_abc/tokens" in seen["url"]
+
+
+def test_mint_token_with_cookies_surfaces_clerk_error_code(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    monkeypatch.setattr(
+        mod.httpx,
+        "post",
+        lambda url, **kw: _mint_resp(
+            403, {"errors": [{"code": "user_banned", "message": "User banned"}]}
+        ),
+    )
+    token = _make_jwt({"exp": int(time.time()) - 5, "sid": "sess_abc"})
+    assert mod.mint_token_with_cookies(token, [{"name": "__client", "value": "c"}]) == (
+        None,
+        "user_banned",
+    )
+
+
+def test_mint_token_with_cookies_no_cookies_or_unparseable_token():
+    import sub2api.channels.adal_cloud as mod
+
+    assert mod.mint_token_with_cookies(_make_jwt({"sid": "s"}), []) == (
+        None,
+        "no_cookies",
+    )
+    assert mod.mint_token_with_cookies(
+        "garbage", [{"name": "__client", "value": "c"}]
+    ) == (None, "no_sid")
+
+
+def test_refresh_token_with_cookies_falls_back_to_original(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: (None, "user_banned")
+    )
+    assert mod.refresh_token_with_cookies("orig", [{"name": "__client", "value": "c"}]) == "orig"
+
+
+@pytest.mark.anyio
+async def test_refresh_slot_auth_marks_dead_on_ban(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    slot = mod.AccountSlot(
+        token=_make_jwt({"exp": int(time.time()) - 10, "sid": "sess_x"}),
+        session_id="s1",
+        cookies=[{"name": "__client", "value": "c"}],
+    )
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: (None, "user_banned")
+    )
+    assert await ch.refresh_slot_auth(slot, force=True) is False
+    assert slot.dead_reason == "user_banned"
+    assert slot.disabled_until > time.monotonic()
+
+
+@pytest.mark.anyio
+async def test_refresh_slot_auth_transient_failure_short_cooldown(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    slot = mod.AccountSlot(
+        token=_make_jwt({"exp": int(time.time()) - 10, "sid": "sess_x"}),
+        session_id="s1",
+        cookies=[{"name": "__client", "value": "c"}],
+    )
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: (None, "transient")
+    )
+    assert await ch.refresh_slot_auth(slot, force=True) is False
+    # transient: parked briefly, but not permanently marked dead
+    assert slot.dead_reason == ""
+    assert 0 < slot.disabled_until - time.monotonic() <= 20
+
+
+@pytest.mark.anyio
+async def test_refresh_slot_auth_updates_token_on_success(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    slot = mod.AccountSlot(
+        token=_make_jwt({"exp": int(time.time()) - 10, "sid": "sess_x"}),
+        session_id="s1",
+        cookies=[{"name": "__client", "value": "c"}],
+    )
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: ("fresh.jwt.sig", None)
+    )
+    assert await ch.refresh_slot_auth(slot, force=True) is True
+    assert slot.token == "fresh.jwt.sig"
+    assert slot.dead_reason == ""
+    assert slot.disabled_until == 0.0
+    assert slot.fail_count == 0
+
+
+@pytest.mark.anyio
+async def test_refresh_slot_auth_fresh_token_short_circuits(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    slot = mod.AccountSlot(
+        token=_make_jwt({"exp": int(time.time()) + 3600, "sid": "sess_x"}),
+        session_id="s1",
+        cookies=[{"name": "__client", "value": "c"}],
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("mint must not be called for a fresh token")
+
+    monkeypatch.setattr(mod, "mint_token_with_cookies", boom)
+    assert await ch.refresh_slot_auth(slot) is True
+
+
+@pytest.mark.anyio
+async def test_ensure_slot_token_skips_when_no_cookies(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    slot = mod.AccountSlot(
+        token=_make_jwt({"exp": int(time.time()) - 10, "sid": "sess_x"}),
+        session_id="s1",
+        cookies=None,
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("mint must not be called without cookies")
+
+    monkeypatch.setattr(mod, "mint_token_with_cookies", boom)
+    await ch._ensure_slot_token(slot)
+
+
+@pytest.mark.anyio
+async def test_acquire_slot_pool_mode_refreshes_stale_token(monkeypatch):
+    """acquire_slot lazily re-mints an expired JWT before handing out the slot."""
+    import sub2api.channels.adal_cloud as mod
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    ch._token = "fallback"
+    ch._registered = {"sess-x"}  # skip registration
+    cfg = PoolConfig(
+        accounts=[
+            AccountConfig(
+                token=_make_jwt(
+                    {"exp": int(time.time()) - 10, "sid": "sess_x"}
+                ),
+                session_id="sess-x",
+                cookies=[{"name": "__client", "value": "c"}],
+            )
+        ]
+    )
+    ch._pool = mod.AccountPool(cfg)
+    await ch._pool.start()
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: ("fresh.jwt.sig", None)
+    )
+    slot, sid = await ch.acquire_slot()
+    assert slot is not None
+    assert slot.token == "fresh.jwt.sig"
+    await ch.release_slot(slot)
+    await ch._pool.close()
+
+
+@pytest.mark.anyio
+async def test_refresh_slot_auth_single_account_rereads_creds(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    ch._token = "old-token"
+    ch._client = None
+    fresh = _make_jwt({"exp": int(time.time()) + 3600})
+    monkeypatch.setattr(mod, "read_token", lambda: fresh)
+    assert await ch.refresh_slot_auth(None) is True
+    assert ch._token == fresh
+    # second call: creds unchanged -> nothing to do
+    assert await ch.refresh_slot_auth(None) is False
+
+
+@pytest.mark.anyio
+async def test_health_reports_dead_accounts(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    config = PoolConfig(
+        accounts=[
+            AccountConfig(token="tok-a", session_id="sid-a"),
+            AccountConfig(token="tok-b", session_id="sid-b"),
+        ]
+    )
+    channel._pool = mod.AccountPool(config)
+    await channel._pool.start()
+    channel._pool_signature = channel._pool_signature_for(config)
+    channel._pool.slots[0].dead_reason = "user_banned"
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: config)
+
+    health = await channel.health()
+    assert health["pool"]["dead_accounts"] == 1
+    assert health["pool"]["slots"][0]["dead_reason"] == "user_banned"
+
+
+# -- passthrough 401 retry ---------------------------------------------------
+
+
+def _passthrough_channel(mod, handler):
+    """Build a started adal-cloud channel wired to a mock transport."""
+    import httpx as _httpx
+
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    ch._started = True
+    ch._catalog = SAMPLE_CATALOG
+    cfg = PoolConfig(
+        accounts=[
+            AccountConfig(
+                token=_make_jwt(
+                    {"exp": int(time.time()) + 3600, "sid": "sess_x"}
+                ),
+                session_id="sess-x",
+                cookies=[{"name": "__client", "value": "c"}],
+            )
+        ]
+    )
+    ch._pool = mod.AccountPool(cfg)
+    ch._client = _httpx.AsyncClient(transport=_httpx.MockTransport(handler))
+    ch._registered = {"sess-x"}
+    return ch, cfg
+
+
+@pytest.mark.anyio
+async def test_messages_passthrough_retries_once_after_401(monkeypatch):
+    """First proxy call 401s -> token re-mints -> retry succeeds end-to-end."""
+    import httpx as _httpx
+
+    import sub2api.channels.adal_cloud as mod
+    import sub2api.server.app as app_mod
+
+    calls = {"n": 0}
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _httpx.Response(401, json={"error_type": "auth_invalid"})
+        return _httpx.Response(
+            200, json={"ok": True, "auth": request.headers.get("authorization", "")}
+        )
+
+    ch, cfg = _passthrough_channel(mod, handler)
+    monkeypatch.setattr(app_mod, "create_channel", lambda name, cfg_: ch)
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: cfg)
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: ("fresh.jwt.sig", None)
+    )
+
+    from sub2api.core.config import AppSettings
+
+    settings = AppSettings(
+        channel="adal-cloud",
+        host="testserver",
+        port=0,
+        channel_config=ChannelConfig(workspace="."),
+    )
+    app = app_mod.create_app(settings)
+    transport = _httpx.ASGITransport(app=app)
+    async with _httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        resp = await c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["auth"] == "Bearer fresh.jwt.sig"
+    assert calls["n"] == 2
+
+
+@pytest.mark.anyio
+async def test_messages_passthrough_no_retry_when_mint_fails(monkeypatch):
+    """When the re-mint fails (e.g. banned), the 401 passes through untouched."""
+    import httpx as _httpx
+
+    import sub2api.channels.adal_cloud as mod
+    import sub2api.server.app as app_mod
+
+    calls = {"n": 0}
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        calls["n"] += 1
+        return _httpx.Response(401, json={"error_type": "auth_invalid"})
+
+    ch, cfg = _passthrough_channel(mod, handler)
+    monkeypatch.setattr(app_mod, "create_channel", lambda name, cfg_: ch)
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: cfg)
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: (None, "user_banned")
+    )
+
+    from sub2api.core.config import AppSettings
+
+    settings = AppSettings(
+        channel="adal-cloud",
+        host="testserver",
+        port=0,
+        channel_config=ChannelConfig(workspace="."),
+    )
+    app = app_mod.create_app(settings)
+    transport = _httpx.ASGITransport(app=app)
+    async with _httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        resp = await c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert resp.status_code == 401
+    assert resp.json()["error_type"] == "auth_invalid"
+    assert calls["n"] == 1
+    # the dead account is parked so the scheduler stops routing to it
+    assert ch._pool.slots[0].dead_reason == "user_banned"
+
+
+@pytest.mark.anyio
+async def test_messages_passthrough_stream_retries_after_401(monkeypatch):
+    """Streaming passthrough also re-mints and retries once on a 401."""
+    import httpx as _httpx
+
+    import sub2api.channels.adal_cloud as mod
+    import sub2api.server.app as app_mod
+
+    calls = {"n": 0}
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _httpx.Response(401, json={"error_type": "auth_invalid"})
+
+        async def sse():
+            yield b'data: {"ok": true}\n\n'
+
+        return _httpx.Response(
+            200,
+            content=sse(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ch, cfg = _passthrough_channel(mod, handler)
+    monkeypatch.setattr(app_mod, "create_channel", lambda name, cfg_: ch)
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *args: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: cfg)
+    monkeypatch.setattr(
+        mod, "mint_token_with_cookies", lambda *a, **k: ("fresh.jwt.sig", None)
+    )
+
+    from sub2api.core.config import AppSettings
+
+    settings = AppSettings(
+        channel="adal-cloud",
+        host="testserver",
+        port=0,
+        channel_config=ChannelConfig(workspace="."),
+    )
+    app = app_mod.create_app(settings)
+    transport = _httpx.ASGITransport(app=app)
+    async with _httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        resp = await c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert '{"ok": true}' in resp.text
+    assert calls["n"] == 2

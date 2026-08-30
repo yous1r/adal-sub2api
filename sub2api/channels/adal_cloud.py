@@ -48,7 +48,7 @@ import httpx
 
 from ..core.channel import BaseChannel
 from ..core.errors import AuthError, RuntimeMissingError, UpstreamError
-from ..core.pool import AccountPool, AccountSlot, load_pool_config
+from ..core.pool import AccountPool, AccountSlot, PoolConfig, load_pool_config
 from ..core.registry import register
 from ..core.types import (
     ChatRequest,
@@ -69,35 +69,48 @@ SESSION_PATH = Path.home() / ".adal" / "adal_session.json"
 
 CLERK_BASE = "https://clerk.adal.sylph.ai"
 
+# Headers that mirror the official client so Clerk treats the mint call as a
+# first-party browser/CLI request rather than an anonymous one.
+CLERK_MINT_HEADERS = {
+    "Origin": "https://adal.sylph.ai",
+    "Referer": "https://adal.sylph.ai/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) adal-cli/1.7.2",
+}
 
-def refresh_token_with_cookies(
+# Clerk error codes (plus local reasons) that mean the JWT can never be
+# re-minted from these credentials; the slot is parked for DEAD_COOLDOWN_S
+# instead of being retried on every request.
+DEAD_MINT_ERRORS = frozenset({"user_banned", "signed_out", "no_cookies", "no_sid"})
+DEAD_COOLDOWN_S = 3600.0
+TRANSIENT_COOLDOWN_S = 15.0
+
+
+def mint_token_with_cookies(
     token: str,
-    cookies: list[dict[str, str]],
+    cookies: list[dict[str, str]] | None,
     *,
     timeout: float = 15.0,
-) -> str:
+) -> tuple[str | None, str | None]:
     """Mint a fresh Clerk JWT using the persisted ``__client`` cookie.
 
-    The JWT's TTL is 60 seconds, but the Clerk session itself lives much longer.
-    ``POST /v1/client/sessions/{sid}/tokens`` with the session cookie mints a
-    new bearer without the interactive device flow.
+    The JWT's TTL is 60 seconds, but the Clerk session itself lives much
+    longer.  ``POST /v1/client/sessions/{sid}/tokens`` with the session
+    cookie mints a new bearer without the interactive device flow.
 
-    Returns the fresh JWT, or the original token if the refresh fails (the
-    proxy keys off session_id, so an expired bearer may still work).
+    Returns ``(fresh_jwt, None)`` on success, or ``(None, error_code)`` on
+    failure where ``error_code`` is a Clerk error code (e.g. ``user_banned``,
+    ``signed_out``) or one of ``no_cookies`` / ``no_sid`` / ``transient``.
     """
-    import httpx
-
-    sid = _jwt_exp  # placeholder to satisfy linters; actual sid extraction below
+    if not cookies:
+        return None, "no_cookies"
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload))
-        clerk_sid = data.get("sid", "")
+        clerk_sid = json.loads(base64.urlsafe_b64decode(payload)).get("sid", "")
     except Exception:
-        return token  # can't extract sid; nothing to refresh
-
+        return None, "no_sid"
     if not clerk_sid:
-        return token
+        return None, "no_sid"
 
     jar = httpx.Cookies()
     for c in cookies:
@@ -110,15 +123,35 @@ def refresh_token_with_cookies(
             f"{CLERK_BASE}/v1/client/sessions/{clerk_sid}/tokens",
             data={"organization_id": "", "token": ""},
             cookies=jar,
+            headers=CLERK_MINT_HEADERS,
             timeout=timeout,
         )
-        if r.status_code == 200:
-            fresh = r.json().get("jwt")
-            if fresh:
-                return fresh
     except Exception:
-        pass
-    return token
+        return None, "transient"
+    if r.status_code == 200:
+        fresh = r.json().get("jwt")
+        if fresh:
+            return fresh, None
+    try:
+        code = r.json()["errors"][0]["code"]
+    except Exception:
+        code = f"http_{r.status_code}"
+    return None, code
+
+
+def refresh_token_with_cookies(
+    token: str,
+    cookies: list[dict[str, str]],
+    *,
+    timeout: float = 15.0,
+) -> str:
+    """Back-compat wrapper around :func:`mint_token_with_cookies`.
+
+    Returns the fresh JWT, or the original token if the refresh fails (the
+    proxy keys off session_id, so an expired bearer may still work).
+    """
+    fresh, _err = mint_token_with_cookies(token, cookies, timeout=timeout)
+    return fresh or token
 
 
 def load_cached_session() -> str | None:
@@ -578,6 +611,161 @@ class AdalCloudChannel(BaseChannel):
         self._client = None
         self._pool = None
         self._proxy_sid = None
+        self._refresh_lock = asyncio.Lock()
+        self._pool_signature: tuple[Any, ...] | None = None
+        self._slot_locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _pool_signature_for(config: PoolConfig | None) -> tuple[Any, ...] | None:
+        if config is None:
+            return None
+        return (
+            config.strategy,
+            config.max_failures,
+            config.cooldown_seconds,
+            tuple(
+                (a.token, a.session_id, a.max_concurrent, repr(a.cookies))
+                for a in config.accounts
+            ),
+        )
+
+    async def refresh(self) -> None:
+        """Refresh the catalog and adopt changed pool definitions safely."""
+        if not self.started:
+            return
+        async with self._refresh_lock:
+            config = await asyncio.to_thread(load_pool_config)
+            signature = self._pool_signature_for(config)
+            pool_changed = signature != self._pool_signature
+            if not pool_changed:
+                if self._pool is None:
+                    catalog = await asyncio.to_thread(fetch_catalog, self.proxy_url)
+                    models = catalog_models(catalog)
+                    if models:
+                        self._catalog = catalog
+                        self.models = models
+                return
+            if config is None or not config.accounts:
+                if self._pool is not None and not await self._pool.close_if_idle():
+                    return
+                if self._pool is not None:
+                    await self._pool.close()
+                self._pool = None
+                self._pool_signature = signature
+                self._registered.clear()
+                if self._client is not None and self._token:
+                    self._client.headers["Authorization"] = f"Bearer {self._token}"
+                return
+            if self._pool is None:
+                self._pool = AccountPool(config)
+                await self._pool.start()
+            elif not await self._pool.reconfigure(config):
+                return
+            catalog = await asyncio.to_thread(fetch_catalog, self.proxy_url)
+            models = catalog_models(catalog)
+            if models:
+                self._catalog = catalog
+                self.models = models
+            self._pool_signature = signature
+            active_sessions = {slot.session_id for slot in self._pool.slots}
+            self._registered.intersection_update(active_sessions)
+            for slot in self._pool.slots:
+                if slot.pre_registered:
+                    self._registered.add(slot.session_id)
+                elif slot.session_id not in self._registered:
+                    try:
+                        await asyncio.to_thread(
+                            register_session,
+                            token=slot.token,
+                            session_id=slot.session_id,
+                        )
+                        self._registered.add(slot.session_id)
+                    except AuthError:
+                        pass
+
+    # -- token lifecycle ---------------------------------------------------
+
+    def _slot_lock(self, session_id: str) -> asyncio.Lock:
+        """One refresh lock per session id so concurrent requests don't
+        stampede Clerk with duplicate mint calls for the same account."""
+        lock = self._slot_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._slot_locks[session_id] = lock
+        return lock
+
+    async def _mint_slot_token(self, slot: AccountSlot) -> bool:
+        """Re-mint ``slot``'s JWT via its Clerk cookies and update its state.
+
+        Returns True when a fresh token is now on the slot.  On a permanent
+        failure (banned user, dead cookies) the slot is parked for
+        ``DEAD_COOLDOWN_S`` with a ``dead_reason`` so the scheduler stops
+        routing requests to it; transient failures get a short cooldown.
+        """
+        fresh, err = await asyncio.to_thread(
+            mint_token_with_cookies, slot.token, slot.cookies or []
+        )
+        if fresh:
+            slot.token = fresh
+            slot.fail_count = 0
+            slot.disabled_until = 0.0
+            slot.dead_reason = ""
+            return True
+        now = time.monotonic()
+        if err in DEAD_MINT_ERRORS:
+            slot.dead_reason = err
+            slot.disabled_until = now + DEAD_COOLDOWN_S
+        else:
+            slot.disabled_until = now + TRANSIENT_COOLDOWN_S
+        return False
+
+    async def _ensure_slot_token(self, slot: AccountSlot) -> None:
+        """Lazily re-mint the slot's JWT when it is expired or near expiry.
+
+        Clerk JWTs carry a 60-second TTL; this keeps a long-running server
+        working without restarts.  Slots without cookies (nothing to mint
+        from) and already-fresh tokens are skipped.  Failures park the slot
+        (see :meth:`_mint_slot_token`).
+        """
+        if not slot.cookies or not token_needs_refresh(slot.token):
+            return
+        async with self._slot_lock(slot.session_id):
+            if token_needs_refresh(slot.token):
+                await self._mint_slot_token(slot)
+
+    async def refresh_slot_auth(
+        self, slot: AccountSlot | None, *, force: bool = False
+    ) -> bool:
+        """Re-mint auth after the proxy rejected a request (HTTP 401).
+
+        Returns True when a usable token is now available and the caller
+        should retry once with rebuilt headers.  ``force`` bypasses the
+        freshness check — used when the bearer looked valid but the proxy
+        still rejected it (e.g. unparseable exp, clock drift).
+
+        In single-account mode (``slot is None``) the cached creds file is
+        re-read instead; an external ``adal`` login may have refreshed it.
+        """
+        if slot is None:
+            return await self._refresh_single_account_token()
+        async with self._slot_lock(slot.session_id):
+            if (
+                not force
+                and not slot.dead_reason
+                and not token_needs_refresh(slot.token)
+            ):
+                return True  # a concurrent request already refreshed it
+            return await self._mint_slot_token(slot)
+
+    async def _refresh_single_account_token(self) -> bool:
+        """Swap in a fresher token from the creds file, if one appeared."""
+        tok = await asyncio.to_thread(read_token)
+        if not tok or tok == self._token or token_needs_refresh(tok):
+            return False
+        self._token = tok
+        if self._client is not None:
+            self._client.headers["Authorization"] = f"Bearer {tok}"
+        return True
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -600,6 +788,7 @@ class AdalCloudChannel(BaseChannel):
         # Authorization header is set per-request from the acquired slot).
         pool_cfg = await asyncio.to_thread(load_pool_config)
         if pool_cfg is not None and pool_cfg.accounts:
+            self._pool_signature = self._pool_signature_for(pool_cfg)
             self._pool = AccountPool(pool_cfg)
             await self._pool.start()
             self._client = httpx.AsyncClient(
@@ -609,16 +798,10 @@ class AdalCloudChannel(BaseChannel):
                     "Accept": "text/event-stream",
                 },
             )
-            # Refresh expired JWTs using persisted Clerk cookies. The JWT's TTL
-            # is 60s, but the Clerk session lives far longer; the __client
-            # cookie lets us mint a fresh bearer without device flow.
-            for slot in self._pool.slots:
-                if slot.cookies and token_needs_refresh(slot.token):
-                    fresh = await asyncio.to_thread(
-                        refresh_token_with_cookies, slot.token, slot.cookies
-                    )
-                    if fresh != slot.token:
-                        slot.token = fresh
+            # JWTs carry a 60s TTL, so bulk-refreshing at startup is pointless
+            # (they'd all be stale again within a minute).  Tokens are
+            # re-minted lazily per request in _ensure_slot_token, and again
+            # with refresh_slot_auth when the proxy answers 401.
 
             # Register only sessions the config did not already register.
             # adal-registrar calls /api/client-sessions/start during signup
@@ -714,6 +897,7 @@ class AdalCloudChannel(BaseChannel):
 
     async def _chat(self, request: ChatRequest) -> AsyncIterator[Event]:
         assert self._client is not None
+        await self.refresh()
         # sub2api allocates the native session id; reuse it across turns.
         session_id = request.native_session_id or f"sub2api-{request.session_id}"
         await self._ensure_registered(session_id)
@@ -732,6 +916,7 @@ class AdalCloudChannel(BaseChannel):
         slot: AccountSlot | None = None
         if self._pool is not None:
             slot = await self._pool.acquire()
+            await self._ensure_slot_token(slot)
             await self._ensure_registered(slot.session_id)
             headers["Authorization"] = f"Bearer {slot.token}"
             headers["X-Session-ID"] = slot.session_id
@@ -768,15 +953,11 @@ class AdalCloudChannel(BaseChannel):
     # -- passthrough (native format, no event normalization) ---------------
 
     async def acquire_slot(self) -> tuple[AccountSlot | None, str]:
-        """Acquire a pool slot for a passthrough request.
-
-        Returns ``(slot, session_id)``.  When the pool is active the slot
-        must be released via ``release_slot`` after the request completes
-        (use ``success=`` to report the outcome).  When no pool is configured
-        ``(None, self._proxy_sid)`` is returned and no release is needed.
-        """
+        """Acquire a pool slot for a passthrough request."""
+        await self.refresh()
         if self._pool is not None:
             slot = await self._pool.acquire()
+            await self._ensure_slot_token(slot)
             await self._ensure_registered(slot.session_id)
             return slot, slot.session_id
         # Single-account fallback.
@@ -937,15 +1118,21 @@ class AdalCloudChannel(BaseChannel):
     # -- health -----------------------------------------------------------
 
     async def health(self) -> dict[str, Any]:
+        await self.refresh()
         base = await super().health()
         base["proxy_url"] = ADAL_PROXY_URL
         base["token_present"] = bool(self._token)
         base["registered_sessions"] = len(self._registered)
-        base["models"] = list(self.models)
         if self._pool is not None:
+            slots = self._pool.slots
+            healthy = [slot for slot in slots if slot.is_healthy]
             base["pool"] = {
                 "enabled": True,
                 "size": self._pool.size,
+                "healthy_accounts": len(healthy),
+                "dead_accounts": sum(1 for s in slots if s.dead_reason),
+                "available_capacity": sum(slot.available_capacity for slot in slots),
+                "models_available": bool(self.models) and bool(healthy),
                 "slots": self._pool.snapshot(),
             }
         else:

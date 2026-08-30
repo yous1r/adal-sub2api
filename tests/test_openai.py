@@ -153,6 +153,25 @@ async def test_models_listing(client):
         assert entry["owned_by"] == "echo"
 
 
+@pytest.mark.anyio
+async def test_models_listing_uses_refreshed_channel_models(app):
+    channel = app.state.channel
+    channel.models = ("before",)
+
+    async def refresh():
+        channel.models = ("after",)
+
+    channel.refresh = refresh
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as c:
+        resp = await c.get("/v1/models")
+
+    assert resp.status_code == 200
+    assert [entry["id"] for entry in resp.json()["data"]] == ["after"]
+
+
 # --- auth guard -------------------------------------------------------------
 
 

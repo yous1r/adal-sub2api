@@ -96,6 +96,8 @@ curl http://127.0.0.1:8080/v1/messages \
   -d '{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
+curl http://127.0.0.1:48080/v1/messages -H "Authorization: Bearer sk-sub2api-secret" -H "Content-Type: application/json" -d '{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'
+
 ```bash
 # OpenAI Responses API（现代端点，支持 reasoning/background/stream）
 curl http://127.0.0.1:8080/v1/responses \
@@ -161,7 +163,7 @@ echo '{"accounts":[{"token":"jwt-a"},{"token":"jwt-b"}]}' > ~/.adal/accounts.jso
 SUB2API_CHANNEL=adal-cloud python -m sub2api
 ```
 
-未配置账号池时，自动退化为单账号模式（使用 `SUB2API_AUTH_TOKEN` 或 `~/.adal/adal_oauth_creds.json`）。池状态可通过 `/healthz` 的 `channel.pool` 字段查看。
+未配置账号池时，自动退化为单账号模式（使用 `SUB2API_AUTH_TOKEN` 或 `~/.adal/adal_oauth_creds.json`）。账号池文件变化会在后续模型、聊天或健康请求前安全重载；池状态可通过 `/healthz` 的 `channel.pool` 字段查看，其中 `healthy_accounts`、`available_capacity` 和 `models_available` 反映当前可用性。
 
 ### Prompt Cache 自动注入（`adal-cloud` 渠道）
 
@@ -206,7 +208,6 @@ $env:SUB2API_PORT=48080;$env:SUB2API_CHANNEL="adal-cloud";$env:SUB2API_API_KEY="
 curl http://127.0.0.1:8080/v1/models -H "Authorization: Bearer sk-sub2api-secret"
 curl http://127.0.0.1:8080/healthz
 ```
-
 
 #### 不经 CLIProxyAPI：直接连接
 

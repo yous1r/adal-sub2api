@@ -60,6 +60,32 @@ def test_load_pool_config_none_when_missing(monkeypatch, tmp_path):
     assert cfg is None
 
 
+@pytest.mark.anyio
+async def test_reconfigure_replaces_accounts_when_idle():
+    pool = _pool(1)
+    await pool.start()
+    changed = PoolConfig(accounts=[AccountConfig(token="new", session_id="new-sid")])
+
+    assert await pool.reconfigure(changed)
+    assert pool.size == 1
+    assert pool.slots[0].token == "new"
+    assert pool.slots[0].session_id == "new-sid"
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_reconfigure_defers_while_request_is_in_flight():
+    pool = _pool(1)
+    await pool.start()
+    slot = await pool.acquire()
+    changed = PoolConfig(accounts=[AccountConfig(token="new")])
+
+    assert not await pool.reconfigure(changed)
+    assert pool.slots[0] is slot
+    await pool.release(slot)
+    await pool.close()
+
+
 def test_pool_requires_at_least_one_account():
     with pytest.raises(ValueError, match="at least one account"):
         AccountPool(PoolConfig(accounts=[]))
@@ -219,4 +245,67 @@ async def test_snapshot_reflects_state():
     assert snap[0]["healthy"] is True
     assert snap[0]["max_concurrent"] == 3
     await pool.release(s)
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_snapshot_includes_dead_reason():
+    pool = _pool(1)
+    await pool.start()
+    pool.slots[0].dead_reason = "user_banned"
+    snap = pool.snapshot()
+    assert snap[0]["dead_reason"] == "user_banned"
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_reconfigure_preserves_dead_state_for_unchanged_accounts():
+    """Re-minted tokens (same cookies) keep the parked state; fresh cookies
+    (account possibly fixed) allow a re-probe."""
+    pool = AccountPool(
+        PoolConfig(
+            accounts=[
+                AccountConfig(
+                    token="tok-a",
+                    session_id="sess-a",
+                    cookies=[{"name": "__client", "value": "c1"}],
+                ),
+                AccountConfig(
+                    token="tok-b",
+                    session_id="sess-b",
+                    cookies=[{"name": "__client", "value": "c2"}],
+                ),
+            ]
+        )
+    )
+    await pool.start()
+    pool.slots[0].dead_reason = "user_banned"
+    pool.slots[0].disabled_until = time.monotonic() + 3600
+    pool.slots[1].dead_reason = "signed_out"
+    pool.slots[1].disabled_until = time.monotonic() + 3600
+
+    ok = await pool.reconfigure(
+        PoolConfig(
+            accounts=[
+                # same cookies as before -> dead state carried over
+                AccountConfig(
+                    token="tok-a2",
+                    session_id="sess-a",
+                    cookies=[{"name": "__client", "value": "c1"}],
+                ),
+                # registrar attached fresh cookies -> allow a re-probe
+                AccountConfig(
+                    token="tok-b2",
+                    session_id="sess-b",
+                    cookies=[{"name": "__client", "value": "c2-new"}],
+                ),
+            ]
+        )
+    )
+    assert ok is True
+    a, b = pool.slots
+    assert a.dead_reason == "user_banned"
+    assert a.disabled_until > time.monotonic()
+    assert b.dead_reason == ""
+    assert b.disabled_until == 0.0
     await pool.close()
