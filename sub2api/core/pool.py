@@ -105,6 +105,9 @@ class AccountSlot:
     token: str
     session_id: str
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    # True when the session_id was provided in the config (adal-registrar
+    # already registered it), so the channel can skip startup registration.
+    pre_registered: bool = False
     # runtime state
     in_flight: int = 0
     fail_count: int = 0
@@ -155,6 +158,7 @@ class AccountPool:
                 token=a.token,
                 session_id=a.session_id or f"sub2api-pool-{i:03d}",
                 max_concurrent=a.max_concurrent,
+                pre_registered=bool(a.session_id),
             )
             for i, a in enumerate(config.accounts)
         ]

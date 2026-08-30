@@ -194,6 +194,9 @@ export SUB2API_CHANNEL=adal-cloud
 export SUB2API_PORT=8080
 export SUB2API_API_KEY=sk-sub2api-secret      # 对外鉴权密钥；CLIProxyAPI 侧需配同样的值
 python -m sub2api
+
+$env:SUB2API_PORT=48080;$env:SUB2API_CHANNEL="adal-cloud";$env:SUB2API_API_KEY="sk-sub2api-secret"; python -m sub2api
+
 # → Uvicorn running on http://127.0.0.1:8080
 ```
 
