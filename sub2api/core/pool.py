@@ -37,6 +37,7 @@ class AccountConfig:
     token: str
     session_id: str = ""
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    cookies: list[dict[str, str]] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AccountConfig:
@@ -44,6 +45,7 @@ class AccountConfig:
             token=str(d["token"]),
             session_id=str(d.get("session_id", "")),
             max_concurrent=int(d.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
+            cookies=d.get("cookies"),
         )
 
 
@@ -105,9 +107,8 @@ class AccountSlot:
     token: str
     session_id: str
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
-    # True when the session_id was provided in the config (adal-registrar
-    # already registered it), so the channel can skip startup registration.
     pre_registered: bool = False
+    cookies: list[dict[str, str]] | None = None
     # runtime state
     in_flight: int = 0
     fail_count: int = 0
@@ -159,6 +160,7 @@ class AccountPool:
                 session_id=a.session_id or f"sub2api-pool-{i:03d}",
                 max_concurrent=a.max_concurrent,
                 pre_registered=bool(a.session_id),
+                cookies=a.cookies,
             )
             for i, a in enumerate(config.accounts)
         ]

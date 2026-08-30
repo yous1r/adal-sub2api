@@ -34,6 +34,7 @@ Docs: https://docs.sylph.ai/cloud-agents/overview
 
 from __future__ import annotations
 
+import base64
 import uuid
 import asyncio
 import json
@@ -65,6 +66,59 @@ CREDS_PATH = Path.home() / ".adal" / "adal_oauth_creds.json"
 # Refresh a token this many seconds before its JWT exp to avoid mid-turn 401s.
 TOKEN_REFRESH_SKEW = 60
 SESSION_PATH = Path.home() / ".adal" / "adal_session.json"
+
+CLERK_BASE = "https://clerk.adal.sylph.ai"
+
+
+def refresh_token_with_cookies(
+    token: str,
+    cookies: list[dict[str, str]],
+    *,
+    timeout: float = 15.0,
+) -> str:
+    """Mint a fresh Clerk JWT using the persisted ``__client`` cookie.
+
+    The JWT's TTL is 60 seconds, but the Clerk session itself lives much longer.
+    ``POST /v1/client/sessions/{sid}/tokens`` with the session cookie mints a
+    new bearer without the interactive device flow.
+
+    Returns the fresh JWT, or the original token if the refresh fails (the
+    proxy keys off session_id, so an expired bearer may still work).
+    """
+    import httpx
+
+    sid = _jwt_exp  # placeholder to satisfy linters; actual sid extraction below
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        clerk_sid = data.get("sid", "")
+    except Exception:
+        return token  # can't extract sid; nothing to refresh
+
+    if not clerk_sid:
+        return token
+
+    jar = httpx.Cookies()
+    for c in cookies:
+        jar.set(
+            c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/")
+        )
+
+    try:
+        r = httpx.post(
+            f"{CLERK_BASE}/v1/client/sessions/{clerk_sid}/tokens",
+            data={"organization_id": "", "token": ""},
+            cookies=jar,
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            fresh = r.json().get("jwt")
+            if fresh:
+                return fresh
+    except Exception:
+        pass
+    return token
 
 
 def load_cached_session() -> str | None:
@@ -555,6 +609,17 @@ class AdalCloudChannel(BaseChannel):
                     "Accept": "text/event-stream",
                 },
             )
+            # Refresh expired JWTs using persisted Clerk cookies. The JWT's TTL
+            # is 60s, but the Clerk session lives far longer; the __client
+            # cookie lets us mint a fresh bearer without device flow.
+            for slot in self._pool.slots:
+                if slot.cookies and token_needs_refresh(slot.token):
+                    fresh = await asyncio.to_thread(
+                        refresh_token_with_cookies, slot.token, slot.cookies
+                    )
+                    if fresh != slot.token:
+                        slot.token = fresh
+
             # Register only sessions the config did not already register.
             # adal-registrar calls /api/client-sessions/start during signup
             # and writes the session_id into accounts.json; those skip here.
