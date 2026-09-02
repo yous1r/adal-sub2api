@@ -86,6 +86,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `POST /v1/responses` | OpenAI Responses API | `api.adal.sylph.ai/proxy/v1/responses`（X-Target-URL 按 model 推断，默认 OpenAI） |
 | `GET /v1/responses/{id}` | OpenAI Responses API | 轮询/获取已创建的 response 对象 |
 | `DELETE /v1/responses/{id}` | OpenAI Responses API | 删除已存储的 response 对象 |
+| `GET /v1/usage` | sub2api 自有 | `adal.sylph.ai/api/subscription/user/{id}`（订阅额度查询，见下文 cc-switch 集成） |
 
 CLIProxyAPI（同时支持 OpenAI 和 Anthropic 上游）可直接把 sub2api 配为上游，无需 SSE 解析。Claude Code 也可直连 `/v1/messages`：
 
@@ -117,6 +118,60 @@ curl http://127.0.0.1:8080/v1/responses/resp_abc123 \
 ```
 
 **注**：归一化事件层（`text.delta`/`thought.delta`/`tool.*`）仅对 `echo`/`adal-cli`/`adal-sdk`/`adal-backend` 等需要翻译的渠道生效；`adal-cloud` 走透传路径时不经过该层。
+
+### 订阅额度查询（cc-switch 集成）
+
+`adal-cloud` 渠道额外暴露 `GET /v1/usage`，直接回报 AdaL 订阅的**真实剩余额度**（美元计价的 credits），供 cc-switch 等客户端展示"用量"：
+
+```bash
+curl http://127.0.0.1:48080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
+```
+
+```json
+{
+  "isValid": true,
+  "planName": "Pro",
+  "total": 80.0,
+  "used": 0.625384,
+  "remaining": 79.374616,
+  "unit": "USD",
+  "extra": "trialing · resets 2026-09-09T09:24:29Z",
+  "sub2api": {
+    "channel": "adal-cloud", "pool_enabled": false,
+    "accounts": 1, "accounts_resolved": 1, "accounts_parked": 0,
+    "queried_at": "2026-09-02T12:29:43Z",
+    "detail": [{ "ok": true, "email": "…", "tier": "pro", "status": "trialing", "…": "…" }]
+  }
+}
+```
+
+机制与语义：
+
+- 账号身份取自各 JWT 的 `sub`（Clerk user id），随后两次**匿名** GET 拿到订阅记录——**token 过期或账号被封依然能查额度**。
+- `total` 取订阅记录的 `monthly_credits`（**不是**套餐目录里的额定值：试用/改价账号两者会不同）；套餐目录只用于把 `tier` 翻成 `planName`。
+- 多账号池模式下，所有**解析成功**的账号额度求和（含已 park 的账号），"不可用"信号通过 `isValid` / `invalidMessage` 表达，而非把数字清零；`planName` 以 `Pro x2` 形式标注同套餐数量，`extra` 附带 park 原因。
+- 聚合结果缓存 30s、套餐目录缓存 600s，账号查询并发上限 8——定时轮询不会放大成上游请求风暴。`?refresh=1` 强制绕过缓存。
+- 额度查询**永不抛错**：上游异常降级为 `isValid: false` + `invalidMessage`，不会让端点 500。
+- 别名：`GET /usage`、`GET /v1/v1/usage`；受 `SUB2API_API_KEY` 保护（未带 key 返回 401）。非 `adal-cloud` 渠道返回 501 `channel_not_supported`。
+
+cc-switch「用量查询 → 自定义脚本」直接粘贴（`127.0.0.1` 属 loopback，免 HTTPS 校验；同源校验因两者同为 sub2api 地址而通过）：
+
+```javascript
+({
+  request: {
+    url: "{{baseUrl}}/v1/usage",
+    method: "GET",
+    headers: { "Authorization": "Bearer {{apiKey}}", "User-Agent": "cc-switch/1.0" }
+  },
+  extractor: function (r) {
+    return {
+      isValid: r.isValid, invalidMessage: r.invalidMessage,
+      planName: r.planName, used: r.used, total: r.total,
+      remaining: r.remaining, unit: r.unit, extra: r.extra
+    };
+  }
+})
+```
 
 ### 多账号池（`adal-cloud` 渠道）
 
@@ -490,6 +545,7 @@ claude-api-key:
 | `POST /v1/chat/stream` | SSE 流式，逐帧输出归一化事件 |
 | `GET /v1/channels` | 已注册渠道列表 + 当前渠道健康状态 |
 | `GET /v1/sessions/{id}` | 会话详情（轮数、native id、模型） |
+| `GET /v1/usage` | 订阅额度（`adal-cloud`）：`isValid`/`planName`/`used`/`total`/`remaining`/`unit`，`?refresh=1` 绕过缓存 |
 | `GET /healthz` | 存活探针 |
 
 请求体：

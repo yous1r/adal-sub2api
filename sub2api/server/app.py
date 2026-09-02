@@ -279,9 +279,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     provider=channel.resolve_provider(body_dict),
                     stream=True,
                 )
-                return StreamingResponse(
-                    fwd_gen, media_type="text/event-stream"
-                )
+                return StreamingResponse(fwd_gen, media_type="text/event-stream")
             # Non-streaming: use a dedicated request with a short read timeout
             # so upstream errors (403/502) return fast instead of hanging.
             resp = await forward_to_proxy(
@@ -396,9 +394,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     headers=build_headers(),
                     timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
                 )
-                if (
-                    resp.status_code == 401
-                    and await channel.refresh_slot_auth(slot, force=True)
+                if resp.status_code == 401 and await channel.refresh_slot_auth(
+                    slot, force=True
                 ):
                     resp = await client.post(
                         url,
@@ -663,6 +660,44 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     async def models_compat(request: Request):
         """Compat alias for GET /models (without /v1 prefix)."""
         return await list_models(request)
+
+    # -- subscription usage ------------------------------------------------
+    # Flat, extractor-friendly quota payload for cc-switch's "用量查询"
+    # custom-script hook: the top-level keys are exactly the fields its
+    # extractor reads (isValid / planName / used / total / remaining / unit /
+    # extra), with sub2api's own per-account detail nested under `sub2api`.
+
+    @app.get("/v1/usage")
+    async def usage(request: Request, refresh: bool = False):
+        """Live subscription credits for the active channel.
+
+        ``?refresh=1`` bypasses the channel's short-lived cache.  Channels
+        with no subscription to report answer 501 ``channel_not_supported``.
+        """
+        denial = unauthorized(request)
+        if denial is not None:
+            return denial
+        fetch = getattr(channel, "usage", None)
+        if fetch is None:
+            return JSONResponse(
+                status_code=501,
+                content=oai.openai_error(
+                    f"channel `{channel.name}` reports no subscription usage",
+                    err_type="api_error",
+                    code="channel_not_supported",
+                ),
+            )
+        return await fetch(refresh=refresh)
+
+    @app.get("/v1/v1/usage")
+    async def usage_v1v1(request: Request, refresh: bool = False):
+        """Compat alias for clients whose base-url includes /v1 twice."""
+        return await usage(request, refresh)
+
+    @app.get("/usage")
+    async def usage_compat(request: Request, refresh: bool = False):
+        """Compat alias for GET /usage (without /v1 prefix)."""
+        return await usage(request, refresh)
 
     @app.get("/v1/channels")
     async def channels():

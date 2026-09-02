@@ -39,6 +39,7 @@ import uuid
 import asyncio
 import json
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, AsyncIterator, ClassVar
 from urllib.error import HTTPError
@@ -103,12 +104,7 @@ def mint_token_with_cookies(
     """
     if not cookies:
         return None, "no_cookies"
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        clerk_sid = json.loads(base64.urlsafe_b64decode(payload)).get("sid", "")
-    except Exception:
-        return None, "no_sid"
+    clerk_sid = _jwt_claims(token).get("sid", "")
     if not clerk_sid:
         return None, "no_sid"
 
@@ -198,14 +194,29 @@ PROVIDER_TARGETS: dict[str, tuple[str, str]] = {
 }
 
 
-def _jwt_exp(token: str) -> int | None:
-    """Return the JWT ``exp`` (unix seconds) or ``None`` if unparseable."""
+def _jwt_claims(token: str) -> dict[str, Any]:
+    """Decode a JWT payload's claims, or ``{}`` when unparseable."""
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
-        return int(json.loads(__import__("base64").urlsafe_b64decode(payload))["exp"])
-    except (IndexError, ValueError, KeyError, TypeError):
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (IndexError, ValueError, TypeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _jwt_exp(token: str) -> int | None:
+    """Return the JWT ``exp`` (unix seconds) or ``None`` if unparseable."""
+    try:
+        return int(_jwt_claims(token)["exp"])
+    except (KeyError, ValueError, TypeError):
         return None
+
+
+def clerk_id_from_token(token: str) -> str:
+    """Return the account's Clerk user id (JWT ``sub``), or ``""``."""
+    sub = _jwt_claims(token).get("sub")
+    return sub if isinstance(sub, str) else ""
 
 
 def read_token(path: Path | None = None) -> str | None:
@@ -416,6 +427,222 @@ def register_session(
     raise AuthError(f"session registration failed: {last_exc}") from last_exc
 
 
+# -- subscription quota ------------------------------------------------------
+# The platform publishes live subscription state at two endpoints keyed by the
+# internal user id:
+#
+#   GET /api/user/by-clerk-id/{clerk_id} -> {"id": <uuid>, "email", "tier", …}
+#   GET /api/subscription/user/{uuid}    -> {"tier", "status",
+#                                            "monthly_credits",
+#                                            "credits_used_this_period",
+#                                            "credits_remaining",
+#                                            "current_period_end", …}
+#
+# Neither requires a bearer: the account is identified by the ``sub`` claim of
+# its JWT, so even an expired token resolves its own quota.  Credits are
+# dollar-denominated (the free tier's 2.0 credits is described upstream as
+# "$2/month"), hence ``USAGE_UNIT``.
+
+USAGE_CACHE_TTL = 30.0  # cc-switch polls on a per-minute timer
+TIERS_CACHE_TTL = 600.0  # the tier catalog is effectively static
+USAGE_FETCH_CONCURRENCY = 8  # parallel account lookups for large pools
+USAGE_UNIT = "USD"
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def fetch_tiers(
+    client: httpx.AsyncClient,
+    *,
+    app_url: str = ADAL_APP_URL,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    """Fetch the tier catalog (``{tier_id: {...}}``); ``{}`` on any failure."""
+    try:
+        resp = await client.get(
+            f"{app_url}/api/subscription/tiers",
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        tiers = resp.json().get("tiers") if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return {}
+    return tiers if isinstance(tiers, dict) else {}
+
+
+def tier_display_name(tiers: dict[str, Any], tier: str) -> str:
+    """Human label for a tier id, falling back to the id itself."""
+    entry = tiers.get(tier) if isinstance(tiers, dict) else None
+    if isinstance(entry, dict):
+        name = entry.get("display_name")
+        if isinstance(name, str) and name:
+            return name
+    return tier
+
+
+async def fetch_account_quota(
+    client: httpx.AsyncClient,
+    token: str,
+    *,
+    app_url: str = ADAL_APP_URL,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    """Resolve one account's subscription credits from its JWT.
+
+    Returns ``{"ok": True, ...}`` with the credit figures, or
+    ``{"ok": False, "error": <reason>}``.  Never raises: a quota lookup must
+    not be able to fail the gateway's usage endpoint.
+    """
+    if not token:
+        return {"ok": False, "error": "no auth token"}
+    clerk_id = clerk_id_from_token(token)
+    if not clerk_id:
+        return {"ok": False, "error": "token carries no clerk id"}
+    headers = {"Accept": "application/json"}
+    try:
+        resp = await client.get(
+            f"{app_url}/api/user/by-clerk-id/{clerk_id}",
+            headers=headers,
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        return {"ok": False, "error": f"user lookup failed: {exc}"}
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"user lookup failed: HTTP {resp.status_code}"}
+    try:
+        user = resp.json()
+        user_id = str(user["id"])
+    except (ValueError, KeyError, TypeError):
+        return {"ok": False, "error": "user lookup returned no id"}
+    email = str(user.get("email") or "")
+    try:
+        resp = await client.get(
+            f"{app_url}/api/subscription/user/{user_id}",
+            headers=headers,
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "error": f"subscription lookup failed: {exc}",
+            "email": email,
+        }
+    if resp.status_code == 404:
+        return {"ok": False, "error": "no subscription", "email": email}
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "error": f"subscription lookup failed: HTTP {resp.status_code}",
+            "email": email,
+        }
+    try:
+        sub = resp.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "error": "subscription lookup returned non-JSON",
+            "email": email,
+        }
+    return {
+        "ok": True,
+        "email": email,
+        "tier": str(sub.get("tier") or user.get("subscription_tier") or ""),
+        "status": str(sub.get("status") or ""),
+        "billing_interval": str(sub.get("billing_interval") or ""),
+        "total": _as_float(sub.get("monthly_credits")),
+        "used": _as_float(sub.get("credits_used_this_period")),
+        "remaining": _as_float(sub.get("credits_remaining")),
+        "is_trialing": bool(sub.get("is_trialing")),
+        "period_end": str(sub.get("current_period_end") or ""),
+    }
+
+
+def _invalid_message(
+    rows: list[dict[str, Any]],
+    resolved: list[dict[str, Any]],
+    parked: list[dict[str, Any]],
+) -> str:
+    """Explain why the gateway cannot currently spend its subscription."""
+    if not rows:
+        return "no adal account configured"
+    if not resolved:
+        errors = sorted({str(r.get("error") or "unknown error") for r in rows})
+        return "; ".join(errors[:3])
+    reasons = sorted({str(r["dead_reason"]) for r in parked})
+    return f"all {len(rows)} account(s) parked: {', '.join(reasons)}"
+
+
+def aggregate_quota(
+    rows: list[dict[str, Any]],
+    tiers: dict[str, Any],
+    *,
+    channel: str = "",
+    pool_enabled: bool = False,
+) -> dict[str, Any]:
+    """Fold per-account quota rows into one flat cc-switch usage payload.
+
+    The top-level keys are exactly the fields a cc-switch usage-script
+    extractor reads (``isValid``, ``invalidMessage``, ``planName``, ``used``,
+    ``total``, ``remaining``, ``unit``, ``extra``).  sub2api's own detail is
+    nested under ``sub2api``, which cc-switch ignores.
+
+    Credit figures sum every account whose subscription resolved, including
+    parked ones — ``isValid``/``invalidMessage`` carry the "cannot spend it"
+    signal instead of silently zeroing the numbers.
+    """
+    resolved = [r for r in rows if r.get("ok")]
+    parked = [r for r in rows if r.get("dead_reason")]
+    counts = Counter(
+        name
+        for name in (
+            tier_display_name(tiers, str(r.get("tier") or "")) for r in resolved
+        )
+        if name
+    )
+    period_ends = sorted(str(r.get("period_end") or "") for r in resolved)
+    notes: list[str] = []
+    if len(resolved) == 1 and resolved[0].get("status"):
+        notes.append(str(resolved[0]["status"]))
+    elif pool_enabled:
+        notes.append(f"{len(resolved)}/{len(rows)} accounts")
+    if parked:
+        reasons = sorted({str(r["dead_reason"]) for r in parked})
+        notes.append(f"{len(parked)} parked ({', '.join(reasons)})")
+    next_reset = next((end for end in period_ends if end), "")
+    if next_reset:
+        notes.append(f"resets {next_reset}")
+    is_valid = bool(resolved) and len(parked) < len(rows)
+    payload: dict[str, Any] = {
+        "isValid": is_valid,
+        "planName": ", ".join(
+            name if count == 1 else f"{name} x{count}"
+            for name, count in sorted(counts.items())
+        ),
+        "total": round(sum(_as_float(r.get("total")) for r in resolved), 6),
+        "used": round(sum(_as_float(r.get("used")) for r in resolved), 6),
+        "remaining": round(sum(_as_float(r.get("remaining")) for r in resolved), 6),
+        "unit": USAGE_UNIT,
+        "extra": " · ".join(notes),
+    }
+    if not is_valid:
+        payload["invalidMessage"] = _invalid_message(rows, resolved, parked)
+    payload["sub2api"] = {
+        "channel": channel,
+        "pool_enabled": pool_enabled,
+        "accounts": len(rows),
+        "accounts_resolved": len(resolved),
+        "accounts_parked": len(parked),
+        "queried_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "detail": rows,
+    }
+    return payload
+
+
 # provider (catalog id) -> upstream target base URL (bare host; proxy keeps
 # the /v1/... suffix from the inbound path).  Used for passthrough routing.
 PROVIDER_BASE_URLS: dict[str, str] = {
@@ -602,6 +829,8 @@ class AdalCloudChannel(BaseChannel):
     _client: httpx.AsyncClient | None
     _pool: AccountPool | None
     _proxy_sid: str | None
+    _usage_cache: tuple[float, dict[str, Any]] | None
+    _tiers_cache: tuple[float, dict[str, Any]] | None
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
@@ -614,6 +843,9 @@ class AdalCloudChannel(BaseChannel):
         self._refresh_lock = asyncio.Lock()
         self._pool_signature: tuple[Any, ...] | None = None
         self._slot_locks: dict[str, asyncio.Lock] = {}
+        self._usage_cache = None
+        self._tiers_cache = None
+        self._usage_lock = asyncio.Lock()
 
     @staticmethod
     def _pool_signature_for(config: PoolConfig | None) -> tuple[Any, ...] | None:
@@ -1114,6 +1346,78 @@ class AdalCloudChannel(BaseChannel):
         if changed:
             return json.dumps(body).encode()
         return raw
+
+    # -- usage / quota -----------------------------------------------------
+
+    def _quota_accounts(self) -> list[tuple[str, str]]:
+        """``(token, dead_reason)`` for every account backing this channel."""
+        if self._pool is not None:
+            return [(slot.token, slot.dead_reason) for slot in self._pool.slots]
+        if self._token:
+            return [(self._token, "")]
+        return []
+
+    async def _tiers(self, client: httpx.AsyncClient) -> dict[str, Any]:
+        now = time.monotonic()
+        if self._tiers_cache is not None and now < self._tiers_cache[0]:
+            return self._tiers_cache[1]
+        tiers = await fetch_tiers(client)
+        if tiers:
+            self._tiers_cache = (time.monotonic() + TIERS_CACHE_TTL, tiers)
+        return tiers
+
+    async def _collect_usage(self, client: httpx.AsyncClient) -> dict[str, Any]:
+        accounts = self._quota_accounts()
+        gate = asyncio.Semaphore(USAGE_FETCH_CONCURRENCY)
+
+        async def one(token: str, dead_reason: str) -> dict[str, Any]:
+            async with gate:
+                row = await fetch_account_quota(client, token)
+            if dead_reason:
+                row["dead_reason"] = dead_reason
+            return row
+
+        tiers, *rows = await asyncio.gather(
+            self._tiers(client), *(one(t, d) for t, d in accounts)
+        )
+        return aggregate_quota(
+            rows,
+            tiers,
+            channel=self.name,
+            pool_enabled=self._pool is not None,
+        )
+
+    async def usage(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Live subscription credits, shaped for a cc-switch usage script.
+
+        Every configured account is resolved concurrently and folded into one
+        flat payload (see :func:`aggregate_quota`).  Results are cached for
+        ``USAGE_CACHE_TTL`` seconds so a client polling on a timer cannot turn
+        into upstream request amplification; ``refresh=True`` bypasses it.
+        """
+        await self.start()
+        deadline_ok = (
+            not refresh
+            and self._usage_cache is not None
+            and time.monotonic() < self._usage_cache[0]
+        )
+        if deadline_ok:
+            return self._usage_cache[1]
+        async with self._usage_lock:
+            if (
+                not refresh
+                and self._usage_cache is not None
+                and time.monotonic() < self._usage_cache[0]
+            ):
+                return self._usage_cache[1]
+            client = self._client
+            if client is not None:
+                payload = await self._collect_usage(client)
+            else:
+                async with httpx.AsyncClient() as temp:
+                    payload = await self._collect_usage(temp)
+            self._usage_cache = (time.monotonic() + USAGE_CACHE_TTL, payload)
+            return payload
 
     # -- health -----------------------------------------------------------
 
