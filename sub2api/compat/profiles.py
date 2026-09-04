@@ -57,6 +57,13 @@ ANTHROPIC_TOOL_NAMES = {
     "text_editor_20250728": "str_replace_based_edit_tool",
 }
 
+# Per-tool extras the upstream tool schema rejects. ``strict`` belongs to the
+# structured-outputs beta, which the upstream SDK wrapper does not enable (its
+# ``betas`` kwarg is itself unsupported — see ANTHROPIC_UNKNOWN_KWARGS), so a
+# tool carrying it can never validate there.
+# Upstream raises: tools.<i>.custom.strict: Extra inputs are not permitted
+ANTHROPIC_TOOL_FORBIDDEN_EXTRA = frozenset({"strict"})
+
 # Measured: each key here provoked an upstream 400 on /v1/chat/completions
 OPENAI_CHAT_DROP = frozenset(
     {

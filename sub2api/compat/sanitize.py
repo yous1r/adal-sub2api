@@ -17,6 +17,7 @@ from sub2api.compat.profiles import (
     ANTHROPIC_FORBIDDEN_EXTRA,
     ANTHROPIC_METADATA_KEEP,
     ANTHROPIC_NO_SAMPLING,
+    ANTHROPIC_TOOL_FORBIDDEN_EXTRA,
     ANTHROPIC_TOOL_NAMES,
     ANTHROPIC_TOOL_TYPES,
     ANTHROPIC_UNKNOWN_KWARGS,
@@ -94,18 +95,25 @@ def _sanitize_anthropic(out: dict, upstream_model: str, dropped: list[str]) -> N
 def _fix_tool(tool: object, index: int, dropped: list[str]) -> object:
     if not isinstance(tool, dict):
         return tool
-    if "type" not in tool:
+    # Two independent rewrites: a forbidden per-tool extra is removed, and an
+    # unknown or misnamed `type` is demoted to a plain custom tool.  A tool
+    # with a natively supported type can still carry a forbidden extra, so
+    # neither check may short-circuit the other.
+    extras = tool.keys() & ANTHROPIC_TOOL_FORBIDDEN_EXTRA
+    demote = "type" in tool and (
+        tool["type"] not in ANTHROPIC_TOOL_TYPES
+        or ANTHROPIC_TOOL_NAMES.get(tool["type"], tool.get("name")) != tool.get("name")
+    )
+    if not extras and not demote:
         return tool
-    tool_type = tool["type"]
-    if tool_type in ANTHROPIC_TOOL_TYPES and ANTHROPIC_TOOL_NAMES.get(
-        tool_type, tool.get("name")
-    ) == tool.get("name"):
-        return tool
-    fixed = dict(tool)
-    fixed["type"] = "custom"
-    if "input_schema" not in fixed:
-        fixed["input_schema"] = dict(_SYNTHETIC_INPUT_SCHEMA)
-    dropped.append(f"tools[{index}].type")
+    fixed = {k: v for k, v in tool.items() if k not in extras}
+    for key in sorted(extras):
+        dropped.append(f"tools[{index}].{key}")
+    if demote:
+        fixed["type"] = "custom"
+        if "input_schema" not in fixed:
+            fixed["input_schema"] = dict(_SYNTHETIC_INPUT_SCHEMA)
+        dropped.append(f"tools[{index}].type")
     return fixed
 
 

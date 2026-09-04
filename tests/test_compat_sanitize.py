@@ -173,6 +173,57 @@ def test_anthropic_untyped_tool_with_input_schema_untouched() -> None:
     assert dropped == []
 
 
+def test_anthropic_tool_strict_dropped_from_custom_tool() -> None:
+    # Measured against the AdaL proxy with claude-fable-5-1 / glm-5.2:
+    # tools.2.custom.strict -> "Extra inputs are not permitted".
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}}
+    body = {
+        "tools": [
+            {"type": "custom", "name": "Edit", "input_schema": schema, "strict": True}
+        ],
+        "max_tokens": 64,
+        "messages": [],
+    }
+    dropped: list[str] = []
+    out = sanitize(
+        body, protocol="anthropic", upstream_model="claude-fable-5-1", dropped=dropped
+    )
+    assert out["tools"] == [{"type": "custom", "name": "Edit", "input_schema": schema}]
+    assert dropped == ["tools[0].strict"]
+
+
+def test_anthropic_tool_strict_dropped_without_demoting_native_type() -> None:
+    # A natively supported tool type must keep its type while still losing the
+    # forbidden extra: the two rewrites are independent.
+    body = {
+        "tools": [{"type": "bash_20250124", "name": "bash", "strict": False}],
+        "max_tokens": 64,
+        "messages": [],
+    }
+    dropped: list[str] = []
+    out = sanitize(
+        body, protocol="anthropic", upstream_model="claude-sonnet-4-6", dropped=dropped
+    )
+    assert out["tools"] == [{"type": "bash_20250124", "name": "bash"}]
+    assert dropped == ["tools[0].strict"]
+
+
+def test_anthropic_untyped_tool_strict_dropped() -> None:
+    # No `type` key at all (Claude Code's default tool shape) still must not
+    # carry `strict` upstream, and must not gain a synthetic type.
+    body = {
+        "tools": [{"name": "Read", "input_schema": {"type": "object"}, "strict": True}],
+        "max_tokens": 64,
+        "messages": [],
+    }
+    dropped: list[str] = []
+    out = sanitize(
+        body, protocol="anthropic", upstream_model="claude-fable-5-1", dropped=dropped
+    )
+    assert out["tools"] == [{"name": "Read", "input_schema": {"type": "object"}}]
+    assert dropped == ["tools[0].strict"]
+
+
 def test_anthropic_no_sampling_temperature_not_forced_on_4_6() -> None:
     # The no-sampling drop must not fire for the 4-6 family: temperature stays
     # subject only to the thinking-mode == 1 rule.
