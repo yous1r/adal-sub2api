@@ -60,33 +60,65 @@ def _bearer_subject(request: httpx.Request) -> str:
     return clerk_id_from_token(header.removeprefix("Bearer "))
 
 
+#: Measured verbatim from the live trial account (tier pro, status trialing).
+#: The monthly and weekly views disagree by design: the subscription endpoint
+#: reports the *allocation*, the balance endpoint the binding weekly ceiling.
+TRIAL_SUB = {
+    "tier": "pro",
+    "status": "trialing",
+    "billing_interval": "monthly",
+    "monthly_credits": 80.0,
+    "credits_used_this_period": 19.828592,
+    "credits_remaining": 60.171408,
+    "is_trialing": True,
+    "current_period_end": "2026-09-09T09:24:29Z",
+}
+TRIAL_BALANCE = {
+    "total": 62.171408,
+    "monthly_allocation": 80.0,
+    "monthly_used": 17.828592,
+    "weekly_usage": {
+        "spent": 19.828592,
+        "limit": 20.0,
+        "remaining": 0.171408,
+        "usage_percentage": 99.14296,
+        "resets_at": "2026-09-09T09:24:29Z",
+        "is_usage_limited": False,
+        "limit_reason": None,
+    },
+}
+ACTIVE_SUB = {
+    "tier": "pro",
+    "status": "active",
+    "billing_interval": "monthly",
+    "monthly_credits": 30.0,
+    "credits_used_this_period": 4.0,
+    "credits_remaining": 26.0,
+    "is_trialing": False,
+    "current_period_end": "2026-10-01T00:00:00Z",
+}
+
+
 def _platform_handler(
     *,
     users: dict[str, dict] | None = None,
     subs: dict[str, dict] | None = None,
+    balances: dict[str, dict] | None = None,
     tiers: dict | None = TIERS,
     calls: dict[str, int] | None = None,
 ):
-    """MockTransport handler for the platform's user/subscription/tier APIs."""
+    """MockTransport handler for the platform's user/subscription/tier APIs.
+
+    ``balances`` is keyed by *clerk id*, matching the measured behaviour of
+    ``/api/credits/balance``: it authenticates from the bearer alone and
+    ignores any user selector.  An account with no entry answers 404, which
+    is the fail-open path (the quota row keeps its monthly figures).
+    """
     users = (
         users if users is not None else {CLERK_ID: {"id": USER_UUID, "email": "a@b.c"}}
     )
-    subs = (
-        subs
-        if subs is not None
-        else {
-            USER_UUID: {
-                "tier": "pro",
-                "status": "trialing",
-                "billing_interval": "monthly",
-                "monthly_credits": 80.0,
-                "credits_used_this_period": 0.624921,
-                "credits_remaining": 79.375079,
-                "is_trialing": True,
-                "current_period_end": "2026-09-09T09:24:29Z",
-            }
-        }
-    )
+    subs = subs if subs is not None else {USER_UUID: dict(TRIAL_SUB)}
+    balances = balances if balances is not None else {CLERK_ID: TRIAL_BALANCE}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if calls is not None:
@@ -96,6 +128,14 @@ def _platform_handler(
             if tiers is None:
                 return httpx.Response(500, text="boom")
             return httpx.Response(200, json={"tiers": tiers})
+        if path == "/api/credits/balance":
+            bearer = _bearer_subject(request)
+            if not bearer:
+                return httpx.Response(401, json={"error_type": "auth_required"})
+            balance = balances.get(bearer)
+            if balance is None:
+                return httpx.Response(404, json={"detail": "Not Found"})
+            return httpx.Response(200, json=balance)
         if path.startswith("/api/user/by-clerk-id/"):
             wanted = path.rsplit("/", 1)[-1]
             bearer = _bearer_subject(request)
@@ -148,17 +188,65 @@ def test_clerk_id_survives_expired_token():
 
 
 @pytest.mark.anyio
-async def test_fetch_account_quota_resolves_credits():
+async def test_fetch_account_quota_reports_the_trial_weekly_cap():
+    """A trial may not spend its monthly allocation, so report the ceiling.
+
+    Measured: the same account and period reads 80.0/60.171408 monthly but
+    20.0/0.171408 weekly.  Reporting the monthly figure tells a client it has
+    60 dollars left when it has 17 cents.
+    """
     async with _mock_client(_platform_handler()) as c:
         row = await fetch_account_quota(c, _token())
     assert row["ok"] is True
     assert row["email"] == "a@b.c"
     assert row["tier"] == "pro"
     assert row["status"] == "trialing"
-    assert row["total"] == 80.0
-    assert row["used"] == pytest.approx(0.624921)
-    assert row["remaining"] == pytest.approx(79.375079)
+    assert row["limit_basis"] == "weekly-trial"
+    assert row["total"] == 20.0
+    assert row["used"] == pytest.approx(19.828592)
+    assert row["remaining"] == pytest.approx(0.171408)
+    # The allocation is kept for inspection, never as the spendable figure.
+    assert row["monthly_total"] == 80.0
+    assert row["monthly_remaining"] == pytest.approx(60.171408)
     assert row["period_end"] == "2026-09-09T09:24:29Z"
+
+
+@pytest.mark.anyio
+async def test_fetch_account_quota_reports_monthly_credits_when_not_trialing():
+    async with _mock_client(_platform_handler(subs={USER_UUID: dict(ACTIVE_SUB)})) as c:
+        row = await fetch_account_quota(c, _token())
+    assert row["limit_basis"] == "monthly"
+    assert (row["total"], row["used"], row["remaining"]) == (30.0, 4.0, 26.0)
+    assert "monthly_total" not in row  # nothing was overridden
+
+
+@pytest.mark.anyio
+async def test_trial_falls_back_to_monthly_when_the_balance_is_unreadable():
+    """A failed balance probe must not zero or invent the spendable figure."""
+    async with _mock_client(_platform_handler(balances={})) as c:
+        row = await fetch_account_quota(c, _token())
+    assert row["ok"] is True
+    assert row["limit_basis"] == "monthly"
+    assert row["remaining"] == pytest.approx(60.171408)
+
+
+@pytest.mark.anyio
+async def test_trial_falls_back_to_monthly_without_a_weekly_ceiling():
+    balance = {"weekly_usage": {"spent": 0.0, "limit": 0.0, "remaining": 0.0}}
+    async with _mock_client(_platform_handler(balances={CLERK_ID: balance})) as c:
+        row = await fetch_account_quota(c, _token())
+    assert row["limit_basis"] == "monthly"
+    assert row["total"] == 80.0
+
+
+@pytest.mark.anyio
+async def test_trial_detected_from_status_alone():
+    sub = dict(TRIAL_SUB)
+    del sub["is_trialing"]  # status is the other measured signal
+    async with _mock_client(_platform_handler(subs={USER_UUID: sub})) as c:
+        row = await fetch_account_quota(c, _token())
+    assert row["limit_basis"] == "weekly-trial"
+    assert row["total"] == 20.0
 
 
 @pytest.mark.anyio
@@ -254,7 +342,21 @@ async def test_fetch_account_quota_targets_platform_endpoints():
     assert seen == [
         f"{ADAL_APP_URL}/api/user/by-clerk-id/{CLERK_ID}",
         f"{ADAL_APP_URL}/api/subscription/user/{USER_UUID}",
+        f"{ADAL_APP_URL}/api/credits/balance",  # trial only: the weekly cap
     ]
+
+
+@pytest.mark.anyio
+async def test_fetch_account_quota_skips_the_balance_probe_when_not_trialing():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return _platform_handler(subs={USER_UUID: dict(ACTIVE_SUB)})(request)
+
+    async with _mock_client(handler) as c:
+        await fetch_account_quota(c, _token())
+    assert f"{ADAL_APP_URL}/api/credits/balance" not in seen
 
 
 # -- tiers -------------------------------------------------------------------
@@ -379,8 +481,44 @@ async def test_channel_usage_single_account():
     ch = _channel(_platform_handler())
     payload = await ch.usage()
     assert payload["isValid"] is True
-    assert payload["remaining"] == pytest.approx(79.375079)
+    # The single account is trialing, so the flat payload carries its weekly
+    # ceiling — the figure cc-switch shows must be the spendable one.
+    assert payload["total"] == 20.0
+    assert payload["remaining"] == pytest.approx(0.171408)
+    assert "trial weekly cap" in payload["extra"]
     assert payload["sub2api"]["pool_enabled"] is False
+    await ch.close()
+
+
+@pytest.mark.anyio
+async def test_channel_usage_mixed_trial_and_paid_pool():
+    """A pool must sum each account's own binding limit, not one basis."""
+    paid = "user_paid"
+    users = {
+        CLERK_ID: {"id": USER_UUID, "email": "trial@b.c"},
+        paid: {"id": "uuid-paid", "email": "paid@b.c"},
+    }
+    subs = {USER_UUID: dict(TRIAL_SUB), "uuid-paid": dict(ACTIVE_SUB)}
+    cfg = PoolConfig(
+        accounts=[
+            AccountConfig(token=_token(), session_id="sid-trial"),
+            AccountConfig(token=_token(paid), session_id="sid-paid"),
+        ]
+    )
+    ch = _channel(
+        _platform_handler(users=users, subs=subs, balances={CLERK_ID: TRIAL_BALANCE}),
+        pool=cfg,
+    )
+    await ch._pool.start()
+
+    payload = await ch.usage()
+
+    assert payload["total"] == 50.0  # 20 trial cap + 30 paid allocation
+    assert payload["remaining"] == pytest.approx(26.171408)
+    assert "1/2 on trial weekly cap" in payload["extra"]
+    bases = [r["limit_basis"] for r in payload["sub2api"]["detail"]]
+    assert sorted(bases) == ["monthly", "weekly-trial"]
+    await ch._pool.close()
     await ch.close()
 
 

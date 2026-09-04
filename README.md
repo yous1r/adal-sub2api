@@ -185,7 +185,7 @@ Claude Code 的典型表现是：**一次流式 200，随后一片 HTTP 500**。
 
 ### 订阅额度查询（cc-switch 集成）
 
-`adal-cloud` 渠道额外暴露 `GET /v1/usage`，直接回报 AdaL 订阅的**真实剩余额度**（美元计价的 credits），供 cc-switch 等客户端展示"用量"：
+`adal-cloud` 渠道额外暴露 `GET /v1/usage`，直接回报 AdaL 订阅**当前实际可花的额度**（美元计价的 credits），供 cc-switch 等客户端展示"用量"。试用期账号按**周限额**报数（见下），付费账号按月度额度：
 
 ```bash
 curl http://127.0.0.1:8080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
@@ -195,18 +195,24 @@ curl http://127.0.0.1:8080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
 {
   "isValid": true,
   "planName": "Pro",
-  "total": 80.0,
-  "used": 0.625384,
-  "remaining": 79.374616,
+  "total": 20.0,
+  "used": 19.828592,
+  "remaining": 0.171408,
   "unit": "USD",
-  "extra": "trialing · resets 2026-09-09T09:24:29Z",
+  "extra": "trialing · trial weekly cap · resets 2026-09-09T09:24:29Z",
   "sub2api": {
     "channel": "adal-cloud", "pool_enabled": false,
     "accounts": 1, "accounts_resolved": 1, "accounts_parked": 0,
-    "queried_at": "2026-09-02T12:29:43Z",
+    "queried_at": "2026-09-04T14:32:11Z",
     "requests": 17, "tokens": 21384, "cost_usd": 0.235578,
     "window": "24h", "rate_source": "calibrated",
-    "detail": [{ "ok": true, "email": "…", "tier": "pro", "status": "trialing", "…": "…" }]
+    "detail": [{
+      "ok": true, "email": "…", "tier": "pro", "status": "trialing",
+      "limit_basis": "weekly-trial",
+      "total": 20.0, "used": 19.828592, "remaining": 0.171408,
+      "monthly_total": 80.0, "monthly_used": 19.828592,
+      "monthly_remaining": 60.171408
+    }]
   }
 }
 ```
@@ -215,8 +221,10 @@ curl http://127.0.0.1:8080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
 
 - 账号身份取自各 JWT 的 `sub`（Clerk user id），随后两次 GET 拿到订阅记录——**token 过期或账号被封依然能查额度**（身份看 `sub` 声明，不验签名新鲜度）。
 - 查询**以被查账号自己的 token 认证**：`/api/user/by-clerk-id/` 允许匿名，但带上*别人*的 `Authorization` 会返回 403 `Cannot query other users`。这就是多账号池必须逐账号带 token 的原因——共享 client 上残留的旧 header 会把整池额度打成 0。
-- `total` 取订阅记录的 `monthly_credits`（**不是**套餐目录里的额定值：试用/改价账号两者会不同）；套餐目录只用于把 `tier` 翻成 `planName`。
-- 多账号池模式下，所有**解析成功**的账号额度求和（含已 park 的账号），"不可用"信号通过 `isValid` / `invalidMessage` 表达，而非把数字清零；`planName` 以 `Pro x2` 形式标注同套餐数量，`extra` 附带 park 原因。
+- **试用账号按周限额报数**。`status: trialing` / `is_trialing: true` 的订阅不允许花掉月度额度：实测同一账号同一周期，订阅接口报 `monthly_credits 80.0 / credits_remaining 60.171408`，而 `/api/credits/balance` 报 `weekly_usage {spent 19.828592, limit 20.0, remaining 0.171408}`——花掉的钱一样，天花板是 20。真正拦请求的是周限额，所以 `total`/`used`/`remaining` 报周限额，月度值保留在 `monthly_*` 里备查，`limit_basis` 标明依据（`weekly-trial` / `monthly`），`extra` 追加 `trial weekly cap`。付费账号不受影响，也**不会**多打这次余额查询。
+- 试用账号的余额查询失败或没有周限额（`limit` 为 0/缺失）时**退回月度值**，绝不凭空造一个上限或清零。
+- 非试用账号的 `total` 取订阅记录的 `monthly_credits`（**不是**套餐目录里的额定值：试用/改价账号两者会不同）；套餐目录只用于把 `tier` 翻成 `planName`。
+- 多账号池模式下，所有**解析成功**的账号额度求和（含已 park 的账号），每个账号按**自己**的依据计入——试用账号计周限额、付费账号计月度额度，`extra` 用 `1/2 on trial weekly cap` 标注比例。"不可用"信号通过 `isValid` / `invalidMessage` 表达，而非把数字清零；`planName` 以 `Pro x2` 形式标注同套餐数量，`extra` 附带 park 原因。
 - 聚合结果缓存 30s、套餐目录缓存 600s，账号查询并发上限 8——定时轮询不会放大成上游请求风暴。`?refresh=1` 强制绕过缓存。
 - 额度查询**永不抛错**：上游异常降级为 `isValid: false` + `invalidMessage`，不会让端点 500。
 - `sub2api.requests` / `tokens` / `cost_usd` 是**本地计量**的滚动 24h 汇总（见「计量与成本」）。未开启计量库时这几个键**不出现**，避免把"没测量"显示成"花了 0"。
@@ -779,7 +787,7 @@ class MyChannel(BaseChannel):
 ## 测试
 
 ```bash
-pytest -q          # 458 个用例：契约、注册表、会话、聚合、兼容层净化/聚合/错误还原、路由表（含原生 id 暴露）、费率、计量库、账号池、四个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层、管理界面（含一键导入/设备码流）、CLI
+pytest -q          # 464 个用例：契约、注册表、会话、聚合、兼容层净化/聚合/错误还原、路由表（含原生 id 暴露）、费率、计量库、账号池、四个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层、订阅额度（含试用周限额）、管理界面（含一键导入/设备码流）、CLI
 ```
 
 无需安装 AdaL 即可跑全部测试——AdaL 渠道用假运行时（临时启动器脚本）做子进程级验证，SDK 渠道测纯映射函数。

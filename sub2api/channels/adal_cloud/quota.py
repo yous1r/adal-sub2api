@@ -40,6 +40,17 @@ _pkg = sys.modules[__package__]
 # ignores the bearer entirely (measured: anonymous, own and alien bearers all
 # return the same 200 body).  Credits are dollar-denominated (the free tier's
 # 2.0 credits is described upstream as "$2/month"), hence ``USAGE_UNIT``.
+#
+# A **trialing** subscription is not allowed to spend its monthly allocation.
+# Measured on a live trial account (tier ``pro``, ``status: trialing``,
+# ``is_trialing: true``): the subscription endpoint reports
+# ``monthly_credits 80.0 / credits_remaining 60.171408`` while
+# ``/api/credits/balance`` reports ``weekly_usage {spent: 19.828592,
+# limit: 20.0, remaining: 0.171408}`` — the same period
+# (``2026-09-02 → 2026-09-09``) and the same spend, capped at 20.0.  The
+# weekly ceiling is the binding one, so for a trial the flat payload reports
+# it; reporting 60 remaining when 0.17 is spendable is how a client ends up
+# firing requests into a 429.
 
 USAGE_CACHE_TTL = 30.0  # cc-switch polls on a per-minute timer
 TIERS_CACHE_TTL = 600.0  # the tier catalog is effectively static
@@ -66,6 +77,13 @@ async def fetch_account_quota(
     Returns ``{"ok": True, ...}`` with the credit figures, or
     ``{"ok": False, "error": <reason>}``.  Never raises: a quota lookup must
     not be able to fail the gateway's usage endpoint.
+
+    ``total``/``used``/``remaining`` are what the account may actually spend.
+    For a **trialing** subscription that is the weekly ceiling, not the
+    monthly allocation (see the module comment), which costs one extra
+    ``/api/credits/balance`` call — trial accounts only.  ``limit_basis``
+    names which basis was used, and the monthly figures are preserved under
+    ``monthly_*`` when they differ.
     """
     if not token:
         return {"ok": False, "error": "no auth token"}
@@ -123,7 +141,7 @@ async def fetch_account_quota(
             "error": "subscription lookup returned non-JSON",
             "email": email,
         }
-    return {
+    row: dict[str, Any] = {
         "ok": True,
         "email": email,
         "tier": str(sub.get("tier") or user.get("subscription_tier") or ""),
@@ -134,7 +152,48 @@ async def fetch_account_quota(
         "remaining": _as_float(sub.get("credits_remaining")),
         "is_trialing": bool(sub.get("is_trialing")),
         "period_end": str(sub.get("current_period_end") or ""),
+        "limit_basis": "monthly",
     }
+    if row["is_trialing"] or row["status"] == "trialing":
+        cap = await _weekly_cap(client, token, app_url=app_url, timeout=timeout)
+        if cap is not None:
+            # Keep the subscription figures for inspection; they are what the
+            # platform *allocated*, not what this account may still spend.
+            row["monthly_total"] = row["total"]
+            row["monthly_used"] = row["used"]
+            row["monthly_remaining"] = row["remaining"]
+            row["total"] = cap["weekly_limit"]
+            row["used"] = cap["weekly_spent"]
+            row["remaining"] = cap["weekly_remaining"]
+            row["limit_basis"] = "weekly-trial"
+            if cap["resets_at"]:
+                # The weekly ceiling is what resets, so that is the deadline
+                # worth reporting (measured: identical to the trial's
+                # current_period_end, since a trial period is one week).
+                row["period_end"] = cap["resets_at"]
+    return row
+
+
+async def _weekly_cap(
+    client: httpx.AsyncClient,
+    token: str,
+    *,
+    app_url: str,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """The weekly spend ceiling for one account, or ``None`` if unreadable.
+
+    ``None`` covers both a failed probe and a payload with no weekly ceiling
+    (``limit`` 0 or absent), so the caller keeps the monthly figures rather
+    than inventing a cap.
+    """
+    payload = await _pkg.fetch_credits_raw(
+        client, token, app_url=app_url, timeout=timeout
+    )
+    snapshot = _pkg.parse_credits_balance(payload)
+    if snapshot is None or snapshot["weekly_limit"] <= 0:
+        return None
+    return snapshot
 
 
 def parse_credits_balance(payload: Any) -> dict[str, Any] | None:
@@ -238,7 +297,9 @@ def aggregate_quota(
 
     Credit figures sum every account whose subscription resolved, including
     parked ones — ``isValid``/``invalidMessage`` carry the "cannot spend it"
-    signal instead of silently zeroing the numbers.
+    signal instead of silently zeroing the numbers.  A trialing account
+    contributes its weekly ceiling (see :func:`fetch_account_quota`), so the
+    totals stay "what this gateway can actually spend"; ``extra`` says so.
     """
     resolved = [r for r in rows if r.get("ok")]
     parked = [r for r in rows if r.get("dead_reason")]
@@ -255,6 +316,13 @@ def aggregate_quota(
         notes.append(str(resolved[0]["status"]))
     elif pool_enabled:
         notes.append(f"{len(resolved)}/{len(rows)} accounts")
+    trials = sum(1 for r in resolved if r.get("limit_basis") == "weekly-trial")
+    if trials:
+        notes.append(
+            "trial weekly cap"
+            if trials == len(resolved)
+            else f"{trials}/{len(resolved)} on trial weekly cap"
+        )
     if parked:
         reasons = sorted({str(r["dead_reason"]) for r in parked})
         notes.append(f"{len(parked)} parked ({', '.join(reasons)})")
