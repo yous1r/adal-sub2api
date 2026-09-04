@@ -3,89 +3,51 @@
 The server knows nothing about any specific agent backend — it only
 speaks ChatRequest/Event. All channel-specific behavior lives behind
 the registry.
+
+Assembly only: the channel, the session store, the lifespan-owned metering
+store and credit-sync task live here, while every route lives in
+``server/routes/*`` behind a ``router(ctx)`` factory.  ``create_channel`` stays
+a module global of *this* module because tests rebind it by attribute.
 """
 
 from __future__ import annotations
 
-import json
-import httpx
-import time
-from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Literal
+import asyncio
+import sqlite3
+from contextlib import asynccontextmanager, suppress
+from typing import Any
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
 
 from .. import __version__, channels  # noqa: F401  (channels = registration)
-from ..core.aggregate import collect_answer
-from ..core.channel import ChannelConfig
 from ..core.config import AppSettings
-from ..core.errors import ChannelMismatchError, SessionNotFoundError
-from ..core.registry import available_channels, create_channel, get_channel_class
-from ..core.sessions import Session, SessionStore
-from ..core.types import (
-    TERMINAL_EVENTS,
-    ChatRequest,
-    Event,
-    SessionStarted,
-    TurnCompleted,
-    TurnFailed,
-)
-from . import openai as oai
+from ..core.registry import create_channel
+from ..core.sessions import SessionStore
+from ..core.store import Store
+from .deps import AppContext
+from .routes import admin, anthropic, chat, models, openai_compat, responses, usage
 
-PermissionMode = Literal["default", "acceptEdits", "yolo"]
+CREDIT_SYNC_INTERVAL = 600.0
 
 
-class ChatBody(BaseModel):
-    prompt: str = Field(min_length=1)
-    session_id: str | None = None
-    model: str | None = None
-    permission_mode: PermissionMode = "default"
-    enabled_tools: list[str] | None = None
-    workspace: str | None = None
-    images: list[str] | None = None
-    thinking_effort: str | None = None
+async def credit_sync_loop(
+    channel: Any, usage_store: Store, interval: float = CREDIT_SYNC_INTERVAL
+) -> None:
+    """Poll every account's credit balance forever, starting immediately.
 
-
-class ChatMessage(BaseModel):
-    role: str = "user"
-    content: Any = None
-
-
-class CompletionBody(BaseModel):
-    messages: list[ChatMessage] = Field(min_length=1)
-    model: str | None = None
-    stream: bool = False
-    thinking_effort: str | None = None
-    reasoning_effort: str | None = None  # OpenAI-compat alias for thinking_effort
-
-
-def error_response(
-    status_code: int, code: str, message: str, **extra: Any
-) -> JSONResponse:
-    payload: dict[str, Any] = {"error": {"code": code, "message": message}}
-    payload["error"].update(extra)
-    return JSONResponse(status_code=status_code, content=payload)
-
-
-def passthrough_json(resp: httpx.Response) -> Any:
-    """Safely extract JSON from an upstream response.
-
-    The proxy may return non-JSON bodies on error (HTML, plain text, empty),
-    which would crash ``resp.json()``.  Fall back to the raw text so the
-    client still sees the status code and body.
+    Runs as a lifespan task so ``usage_limited`` is known before the first
+    request instead of being discovered by burning one.  Every failure is
+    swallowed: a credit probe must never take the gateway down, and the next
+    tick retries anyway.
     """
-    if not resp.content:
-        return {}
-    try:
-        return resp.json()
-    except (json.JSONDecodeError, ValueError):
-        return {"raw": resp.text[:2000]}
-
-
-def sse_frame(event: Event) -> str:
-    return f"data: {json.dumps(event.to_dict(), ensure_ascii=False)}\n\n"
+    while True:
+        try:
+            await channel.refresh_credits(usage_store)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a probe failure is not fatal
+            pass
+        await asyncio.sleep(interval)
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
@@ -95,9 +57,31 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # The metering store is opened at startup, never in create_app:
+        # constructing an app object (tests, --help) must not create a
+        # database file.  A store that cannot be opened degrades to no
+        # metering rather than refusing to serve.
+        usage_store: Store | None = None
+        credit_task: asyncio.Task | None = None
+        try:
+            usage_store = Store(settings.db or None)
+        except (sqlite3.Error, OSError):
+            usage_store = None
+        app.state.usage_store = usage_store
         await channel.start()
-        yield
-        await channel.close()
+        if usage_store is not None and hasattr(channel, "refresh_credits"):
+            credit_task = asyncio.create_task(credit_sync_loop(channel, usage_store))
+            app.state.credit_task = credit_task
+        try:
+            yield
+        finally:
+            if credit_task is not None:
+                credit_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await credit_task
+            await channel.close()
+            if usage_store is not None:
+                await usage_store.close()
 
     app = FastAPI(
         title="sub2api",
@@ -109,629 +93,25 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.channel = channel
     app.state.store = store
+    app.state.usage_store = None
+    app.state.credit_task = None
 
-    def unauthorized(request: Request) -> JSONResponse | None:
-        """Bearer guard; open when no API key is configured."""
-        expected = settings.api_key
-        if not expected:
-            return None
-        provided = request.headers.get("authorization", "")
-        if provided != f"Bearer {expected}":
-            return JSONResponse(
-                status_code=401,
-                content=oai.openai_error(
-                    "invalid api key", err_type="authentication_error"
-                ),
-            )
-        return None
+    ctx = AppContext(settings=settings, channel=channel, store=store)
+    # Registration order mirrors the pre-split app; each alias travels with the
+    # handler it delegates to.  No parameterized path shadows a literal one.
+    app.include_router(chat.router(ctx))
+    app.include_router(openai_compat.router(ctx))
+    app.include_router(models.router(ctx))
+    app.include_router(anthropic.router(ctx))
+    app.include_router(responses.router(ctx))
+    app.include_router(usage.router(ctx))
+    app.include_router(admin.router(ctx))
 
-    def effective_tools(
-        request_tools: list[str] | tuple[str, ...] | None,
-    ) -> tuple[str, ...] | None:
-        if request_tools:
-            return tuple(request_tools)
-        return settings.enabled_tools
+    if settings.web:
+        # Imported lazily so a build without --web never pays for the admin
+        # module, and never exposes an /admin route by accident.
+        from .routes import web as web_routes
 
-    def resolve_session(body: ChatBody) -> tuple[Session, JSONResponse | None]:
-        """Common session logic: reuse or create, validate channel match."""
-        if body.session_id:
-            try:
-                session = store.get(body.session_id)
-            except SessionNotFoundError as exc:
-                return None, error_response(404, exc.code, str(exc))
-            if session.channel != channel.name:
-                return None, error_response(
-                    409,
-                    ChannelMismatchError.code,
-                    f"session belongs to channel `{session.channel}`, not `{channel.name}`",
-                )
-            return session, None
-        return store.create(channel.name), None
-
-    def build_request(body: ChatBody, session: Session) -> ChatRequest:
-        return ChatRequest(
-            prompt=body.prompt,
-            session_id=session.id,
-            native_session_id=session.native_session_id,
-            model=body.model,
-            workspace=body.workspace,
-            permission_mode=body.permission_mode,
-            enabled_tools=effective_tools(body.enabled_tools),
-            images=tuple(body.images) if body.images else None,
-            thinking_effort=body.thinking_effort,
-        )
-
-    @app.post("/v1/chat")
-    async def chat(body: ChatBody, request: Request):
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        session, failure = resolve_session(body)
-        if failure is not None:
-            return failure
-        request = build_request(body, session)
-        answer, terminal = await collect_answer(channel.chat(request))
-        store.touch(session)
-        if isinstance(terminal, TurnCompleted):
-            store.adopt_native(session, terminal.session_id, terminal.model)
-        elif terminal is None or terminal.type == "turn.failed":
-            detail = (
-                terminal.message
-                if terminal
-                else "stream ended without a terminal event"
-            )
-            code = terminal.code if terminal else "internal_error"
-            return error_response(502, code, detail, session_id=session.id)
-        return {
-            "answer": answer,
-            "session_id": session.id,
-            "channel": channel.name,
-            "model": getattr(terminal, "model", None) or body.model,
-        }
-
-    @app.post("/v1/chat/stream")
-    async def chat_stream(body: ChatBody, request: Request):
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        session, failure = resolve_session(body)
-        if failure is not None:
-            return failure
-        request = build_request(body, session)
-
-        async def stream() -> AsyncIterator[str]:
-            yield sse_frame(SessionStarted(session_id=session.id, channel=channel.name))
-            async for event in channel.chat(request):
-                if isinstance(event, TurnCompleted):
-                    store.adopt_native(session, event.session_id, event.model)
-                yield sse_frame(event)
-            store.touch(session)
-
-        return StreamingResponse(stream(), media_type="text/event-stream")
-
-    def default_model() -> str:
-        return channel.models[0] if channel.models else "default"
-
-    async def completion_stream(
-        chat_request: ChatRequest, created: int
-    ) -> AsyncIterator[str]:
-        cid = oai.completion_id()
-        model = chat_request.model or default_model()
-
-        def frame(delta: dict[str, Any], finish_reason: str | None = None) -> str:
-            payload = oai.build_chunk(
-                id=cid,
-                created=created,
-                model=model,
-                delta=delta,
-                finish_reason=finish_reason,
-            )
-            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-        yield frame({"role": "assistant"})
-        async for event in channel.chat(chat_request):
-            if event.type == "text.delta":
-                yield frame({"content": event.text})
-            elif event.type == "message.completed":
-                yield frame({"content": event.text})
-            elif event.type == "thought.delta":
-                # DeepSeek-style extension; ignored by clients that don't use it
-                yield frame({"reasoning_content": event.text})
-            elif isinstance(event, TurnCompleted):
-                yield frame({}, finish_reason="stop")
-                break
-            elif isinstance(event, TurnFailed):
-                _, err_type = oai.error_status_and_type(event.code)
-                payload = oai.build_chunk(
-                    id=cid, created=created, model=model, delta={}, finish_reason="stop"
-                )
-                payload["error"] = {
-                    "message": event.message,
-                    "type": err_type,
-                    "code": event.code,
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                break
-        yield "data: [DONE]\n\n"
-
-    @app.post("/v1/chat/completions")
-    async def chat_completions(body: CompletionBody, request: Request):
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        # Fast path: when the channel is a transparent cloud proxy, forward the
-        # client's OpenAI request verbatim — tools, usage, and the full
-        # multi-turn messages array all pass through unchanged.
-        if channel_supports_passthrough():
-            raw = await request.body()
-            body_dict = json.loads(raw) if raw else {}
-            target = channel.resolve_target("/v1/chat/completions", body_dict)
-            slot, sid = await channel.acquire_slot()
-            url = f"{channel.proxy_url}/proxy/v1/chat/completions"
-            fwd_body = channel.rewrite_body(raw)
-            if body.stream:
-                fwd_gen = await forward_to_proxy(
-                    url=url,
-                    fwd_body=fwd_body,
-                    slot=slot,
-                    sid=sid,
-                    target=target,
-                    provider=channel.resolve_provider(body_dict),
-                    stream=True,
-                )
-                return StreamingResponse(fwd_gen, media_type="text/event-stream")
-            # Non-streaming: use a dedicated request with a short read timeout
-            # so upstream errors (403/502) return fast instead of hanging.
-            resp = await forward_to_proxy(
-                url=url,
-                fwd_body=fwd_body,
-                slot=slot,
-                sid=sid,
-                target=target,
-                provider=channel.resolve_provider(body_dict),
-                stream=False,
-            )
-            return JSONResponse(
-                status_code=resp.status_code,
-                content=passthrough_json(resp),
-            )
-        chat_request = ChatRequest(
-            prompt=oai.messages_to_prompt([m.model_dump() for m in body.messages]),
-            session_id=None,
-            model=body.model,
-            permission_mode=settings.openai_permission_mode,
-            thinking_effort=body.thinking_effort or body.reasoning_effort,
-        )
-        created = oai.now_epoch()
-        if body.stream:
-            return StreamingResponse(
-                completion_stream(chat_request, created), media_type="text/event-stream"
-            )
-        answer, terminal = await collect_answer(channel.chat(chat_request))
-        if terminal is None or isinstance(terminal, TurnFailed):
-            code = terminal.code if terminal else "internal_error"
-            message = (
-                terminal.message
-                if terminal
-                else "stream ended without a terminal event"
-            )
-            status, err_type = oai.error_status_and_type(code)
-            return JSONResponse(
-                status_code=status,
-                content=oai.openai_error(message, err_type=err_type, code=code),
-            )
-        return oai.build_completion(
-            id=oai.completion_id(),
-            created=created,
-            model=getattr(terminal, "model", None)
-            or chat_request.model
-            or default_model(),
-            content=answer,
-        )
-
-    @app.get("/v1/models")
-    async def list_models(request: Request):
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        await channel.refresh()
-        created = oai.now_epoch()
-        data = [
-            {"id": m, "object": "model", "created": created, "owned_by": channel.name}
-            for m in channel.models
-        ]
-        return {"object": "list", "data": data}
-
-    # -- native passthrough ------------------------------------------------
-    # When the active channel is a transparent cloud proxy (e.g. adal-cloud),
-    # forward Anthropic (/v1/messages) and OpenAI (/v1/chat/completions)
-    # requests verbatim to the proxy. This skips the normalized-event layer
-    # entirely — CLIProxyAPI (or any Anthropic/OpenAI client) speaks its own
-    # protocol end-to-end with zero loss (tools, usage, multi-turn all pass).
-
-    def channel_supports_passthrough() -> bool:
-        return all(
-            hasattr(channel, m)
-            for m in (
-                "acquire_slot",
-                "release_slot",
-                "proxy_headers",
-                "resolve_target",
-                "resolve_provider",
-                "rewrite_body",
-            )
-        )
-
-    async def forward_to_proxy(
-        *,
-        url: str,
-        fwd_body: bytes,
-        slot: Any,
-        sid: str,
-        target: str,
-        provider: str,
-        stream: bool,
-    ):
-        """POST the payload to the cloud proxy with one auth-retry.
-
-        On an HTTP 401 the channel re-mints the bearer from the account's
-        Clerk cookies (:meth:`refresh_slot_auth`) and the request is retried
-        once with rebuilt headers.  Returns the ``httpx.Response``
-        (non-streaming) or the streaming byte generator; the slot is
-        released exactly once in either case.
-        """
-        client = channel._client
-        assert client is not None
-
-        def build_headers() -> dict[str, str]:
-            return channel.proxy_headers(sid, target, provider, slot=slot)
-
-        if not stream:
-            try:
-                resp = await client.post(
-                    url,
-                    content=fwd_body,
-                    headers=build_headers(),
-                    timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
-                )
-                if resp.status_code == 401 and await channel.refresh_slot_auth(
-                    slot, force=True
-                ):
-                    resp = await client.post(
-                        url,
-                        content=fwd_body,
-                        headers=build_headers(),
-                        timeout=httpx.Timeout(300.0, connect=15.0, read=60.0),
-                    )
-            except Exception:
-                await channel.release_slot(slot, success=False)
-                raise
-            await channel.release_slot(slot, success=resp.status_code < 500)
-            return resp
-
-        async def gen() -> AsyncIterator[bytes]:
-            ok = True
-            try:
-                for attempt in range(2):
-                    retry = False
-                    async with client.stream(
-                        "POST",
-                        url,
-                        content=fwd_body,
-                        headers=build_headers(),
-                        timeout=httpx.Timeout(600.0, connect=15.0, read=None),
-                    ) as resp:
-                        if resp.status_code == 401 and attempt == 0:
-                            retry = True
-                            await resp.aread()  # drain the error body
-                        else:
-                            async for chunk in resp.aiter_raw():
-                                yield chunk
-                    if retry and await channel.refresh_slot_auth(slot, force=True):
-                        continue
-                    break
-            except Exception:
-                ok = False
-                raise
-            finally:
-                await channel.release_slot(slot, success=ok)
-
-        return gen()
-
-    @app.post("/v1/messages")
-    async def messages_passthrough(request: Request):
-        """Anthropic Messages API passthrough to the cloud proxy."""
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        if not channel_supports_passthrough():
-            return JSONResponse(
-                status_code=501,
-                content=oai.openai_error(
-                    f"channel `{channel.name}` has no native passthrough",
-                    err_type="api_error",
-                    code="channel_not_supported",
-                ),
-            )
-        raw = await request.body()
-        try:
-            body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            return JSONResponse(
-                status_code=400,
-                content=oai.openai_error(
-                    "invalid JSON body",
-                    err_type="invalid_request_error",
-                    code="bad_request",
-                ),
-            )
-        target = channel.resolve_target("/v1/messages", body)
-        slot, sid = await channel.acquire_slot()
-        stream = bool(body.get("stream"))
-        url = channel.proxy_url + "/proxy/v1/messages"
-        if not url:
-            await channel.release_slot(slot)
-            return JSONResponse(
-                status_code=501,
-                content=oai.openai_error("proxy url missing", err_type="api_error"),
-            )
-        fwd_body = channel.rewrite_body(raw)
-        if stream:
-            fwd_gen = await forward_to_proxy(
-                url=url,
-                fwd_body=fwd_body,
-                slot=slot,
-                sid=sid,
-                target=target,
-                provider=channel.resolve_provider(body),
-                stream=True,
-            )
-            return StreamingResponse(fwd_gen, media_type="text/event-stream")
-        resp = await forward_to_proxy(
-            url=url,
-            fwd_body=fwd_body,
-            slot=slot,
-            sid=sid,
-            target=target,
-            provider=channel.resolve_provider(body),
-            stream=False,
-        )
-        return JSONResponse(
-            status_code=resp.status_code, content=passthrough_json(resp)
-        )
-
-    @app.post("/v1/responses")
-    async def responses_passthrough(request: Request):
-        """OpenAI Responses API passthrough to the cloud proxy.
-
-        The Responses API is OpenAI's modern, stateful endpoint for reasoning
-        models and agentic workloads.  When the active channel is a transparent
-        cloud proxy (e.g. adal-cloud), forward the client's request verbatim to
-        the proxy's ``/proxy/v1/responses`` path — ``input``, ``tools``,
-        ``reasoning``, ``background`` mode, streaming events
-        (``response.created`` … ``response.completed``) all pass through
-        unchanged.  The proxy keeps the ``/v1/...`` suffix from the inbound
-        path and sets ``X-Target-URL`` to the upstream OpenAI host.
-        """
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        if not channel_supports_passthrough():
-            return JSONResponse(
-                status_code=501,
-                content=oai.openai_error(
-                    f"channel `{channel.name}` has no native passthrough",
-                    err_type="api_error",
-                    code="channel_not_supported",
-                ),
-            )
-        raw = await request.body()
-        try:
-            body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            return JSONResponse(
-                status_code=400,
-                content=oai.openai_error(
-                    "invalid JSON body",
-                    err_type="invalid_request_error",
-                    code="bad_request",
-                ),
-            )
-        target = channel.resolve_target("/v1/responses", body)
-        slot, sid = await channel.acquire_slot()
-        stream = bool(body.get("stream"))
-        url = f"{channel.proxy_url}/proxy/v1/responses"
-        fwd_body = channel.rewrite_body(raw)
-        if stream:
-            fwd_gen = await forward_to_proxy(
-                url=url,
-                fwd_body=fwd_body,
-                slot=slot,
-                sid=sid,
-                target=target,
-                provider=channel.resolve_provider(body),
-                stream=True,
-            )
-            return StreamingResponse(fwd_gen, media_type="text/event-stream")
-        resp = await forward_to_proxy(
-            url=url,
-            fwd_body=fwd_body,
-            slot=slot,
-            sid=sid,
-            target=target,
-            provider=channel.resolve_provider(body),
-            stream=False,
-        )
-        return JSONResponse(
-            status_code=resp.status_code, content=passthrough_json(resp)
-        )
-
-    @app.get("/v1/responses/{response_id}")
-    async def responses_get(response_id: str, request: Request):
-        """Retrieve a previously created Responses API object."""
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        if not channel_supports_passthrough():
-            return JSONResponse(
-                status_code=501,
-                content=oai.openai_error(
-                    f"channel `{channel.name}` has no native passthrough",
-                    err_type="api_error",
-                    code="channel_not_supported",
-                ),
-            )
-        target = channel.resolve_target("/v1/responses", {})
-        slot, sid = await channel.acquire_slot()
-        headers = channel.proxy_headers(sid, target, "", slot=slot)
-        url = f"{channel.proxy_url}/proxy/v1/responses/{response_id}"
-        client = channel._client
-        assert client is not None
-        try:
-            resp = await client.get(
-                url,
-                headers=headers,
-                timeout=httpx.Timeout(60.0, connect=15.0, read=30.0),
-            )
-        except Exception:
-            await channel.release_slot(slot, success=False)
-            raise
-        await channel.release_slot(slot, success=resp.status_code < 500)
-        return JSONResponse(
-            status_code=resp.status_code, content=passthrough_json(resp)
-        )
-
-    @app.delete("/v1/responses/{response_id}")
-    async def responses_delete(response_id: str, request: Request):
-        """Delete a stored Responses API object."""
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        if not channel_supports_passthrough():
-            return JSONResponse(
-                status_code=501,
-                content=oai.openai_error(
-                    f"channel `{channel.name}` has no native passthrough",
-                    err_type="api_error",
-                    code="channel_not_supported",
-                ),
-            )
-        target = channel.resolve_target("/v1/responses", {})
-        slot, sid = await channel.acquire_slot()
-        headers = channel.proxy_headers(sid, target, "", slot=slot)
-        url = f"{channel.proxy_url}/proxy/v1/responses/{response_id}"
-        client = channel._client
-        assert client is not None
-        try:
-            resp = await client.delete(
-                url,
-                headers=headers,
-                timeout=httpx.Timeout(60.0, connect=15.0, read=30.0),
-            )
-        except Exception:
-            await channel.release_slot(slot, success=False)
-            raise
-        await channel.release_slot(slot, success=resp.status_code < 500)
-        return JSONResponse(
-            status_code=resp.status_code, content=passthrough_json(resp)
-        )
-
-    @app.post("/v1/v1/responses")
-    async def responses_passthrough_v1v1(request: Request):
-        """Compat alias for clients whose base-url includes /v1 twice."""
-        return await responses_passthrough(request)
-
-    @app.post("/v1/v1/messages")
-    async def messages_passthrough_v1v1(request: Request):
-        """Compat alias for clients whose base-url includes /v1 twice."""
-        return await messages_passthrough(request)
-
-    @app.post("/v1/v1/chat/completions")
-    async def chat_completions_v1v1(body: CompletionBody, request: Request):
-        """Compat alias for clients whose base-url includes /v1 twice."""
-        return await chat_completions(body, request)
-
-    @app.post("/v1/completions")
-    async def completions_compat(body: CompletionBody, request: Request):
-        """Compat alias for legacy /v1/completions (maps to chat/completions)."""
-        return await chat_completions(body, request)
-
-    @app.get("/models")
-    async def models_compat(request: Request):
-        """Compat alias for GET /models (without /v1 prefix)."""
-        return await list_models(request)
-
-    # -- subscription usage ------------------------------------------------
-    # Flat, extractor-friendly quota payload for cc-switch's "用量查询"
-    # custom-script hook: the top-level keys are exactly the fields its
-    # extractor reads (isValid / planName / used / total / remaining / unit /
-    # extra), with sub2api's own per-account detail nested under `sub2api`.
-
-    @app.get("/v1/usage")
-    async def usage(request: Request, refresh: bool = False):
-        """Live subscription credits for the active channel.
-
-        ``?refresh=1`` bypasses the channel's short-lived cache.  Channels
-        with no subscription to report answer 501 ``channel_not_supported``.
-        """
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        fetch = getattr(channel, "usage", None)
-        if fetch is None:
-            return JSONResponse(
-                status_code=501,
-                content=oai.openai_error(
-                    f"channel `{channel.name}` reports no subscription usage",
-                    err_type="api_error",
-                    code="channel_not_supported",
-                ),
-            )
-        return await fetch(refresh=refresh)
-
-    @app.get("/v1/v1/usage")
-    async def usage_v1v1(request: Request, refresh: bool = False):
-        """Compat alias for clients whose base-url includes /v1 twice."""
-        return await usage(request, refresh)
-
-    @app.get("/usage")
-    async def usage_compat(request: Request, refresh: bool = False):
-        """Compat alias for GET /usage (without /v1 prefix)."""
-        return await usage(request, refresh)
-
-    @app.get("/v1/channels")
-    async def channels():
-        configured = channel.name
-        listing = []
-        for name in available_channels():
-            cls = get_channel_class(name)
-            listing.append(
-                {
-                    "name": name,
-                    "display_name": cls.display_name or name,
-                    "models": list(cls.models),
-                    "configured": name == configured,
-                }
-            )
-        return {"channels": listing, "active": await channel.health()}
-
-    @app.get("/v1/sessions/{session_id}")
-    async def session_info(session_id: str, request: Request):
-        denial = unauthorized(request)
-        if denial is not None:
-            return denial
-        try:
-            session = store.get(session_id)
-        except SessionNotFoundError as exc:
-            return error_response(404, exc.code, str(exc))
-        return session.to_dict()
-
-    @app.get("/healthz")
-    async def healthz():
-        return {
-            "status": "ok",
-            "version": __version__,
-            "channel": await channel.health(),
-        }
+        app.include_router(web_routes.router())
 
     return app

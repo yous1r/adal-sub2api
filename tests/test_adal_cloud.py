@@ -496,7 +496,9 @@ def test_device_flow_login_raises_on_expired(monkeypatch, tmp_path):
 
 def test_adal_cloud_channel_class_attrs():
     assert AdalCloudChannel.name == "adal-cloud"
-    assert "anthropic-claude-sonnet-5" in AdalCloudChannel.models
+    # The class advertises nothing: models come from the live catalog, filtered
+    # to providers the proxy can actually reach (reachable_models).
+    assert AdalCloudChannel.models == ()
     ch = AdalCloudChannel(ChannelConfig())
     assert ch.runtime_available() is True
 
@@ -837,7 +839,10 @@ def test_refresh_token_with_cookies_falls_back_to_original(monkeypatch):
     monkeypatch.setattr(
         mod, "mint_token_with_cookies", lambda *a, **k: (None, "user_banned")
     )
-    assert mod.refresh_token_with_cookies("orig", [{"name": "__client", "value": "c"}]) == "orig"
+    assert (
+        mod.refresh_token_with_cookies("orig", [{"name": "__client", "value": "c"}])
+        == "orig"
+    )
 
 
 @pytest.mark.anyio
@@ -944,9 +949,7 @@ async def test_acquire_slot_pool_mode_refreshes_stale_token(monkeypatch):
     cfg = PoolConfig(
         accounts=[
             AccountConfig(
-                token=_make_jwt(
-                    {"exp": int(time.time()) - 10, "sid": "sess_x"}
-                ),
+                token=_make_jwt({"exp": int(time.time()) - 10, "sid": "sess_x"}),
                 session_id="sess-x",
                 cookies=[{"name": "__client", "value": "c"}],
             )
@@ -1016,9 +1019,7 @@ def _passthrough_channel(mod, handler):
     cfg = PoolConfig(
         accounts=[
             AccountConfig(
-                token=_make_jwt(
-                    {"exp": int(time.time()) + 3600, "sid": "sess_x"}
-                ),
+                token=_make_jwt({"exp": int(time.time()) + 3600, "sid": "sess_x"}),
                 session_id="sess-x",
                 cookies=[{"name": "__client", "value": "c"}],
             )
@@ -1066,7 +1067,9 @@ async def test_messages_passthrough_retries_once_after_401(monkeypatch):
     )
     app = app_mod.create_app(settings)
     transport = _httpx.ASGITransport(app=app)
-    async with _httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+    async with _httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as c:
         resp = await c.post(
             "/v1/messages",
             json={
@@ -1113,7 +1116,9 @@ async def test_messages_passthrough_no_retry_when_mint_fails(monkeypatch):
     )
     app = app_mod.create_app(settings)
     transport = _httpx.ASGITransport(app=app)
-    async with _httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+    async with _httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as c:
         resp = await c.post(
             "/v1/messages",
             json={
@@ -1172,7 +1177,9 @@ async def test_messages_passthrough_stream_retries_after_401(monkeypatch):
     )
     app = app_mod.create_app(settings)
     transport = _httpx.ASGITransport(app=app)
-    async with _httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+    async with _httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as c:
         resp = await c.post(
             "/v1/messages",
             json={

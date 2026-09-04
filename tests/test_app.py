@@ -6,11 +6,20 @@ from tests.conftest import parse_sse
 
 
 @pytest.mark.anyio
-async def test_healthz(client):
+async def test_healthz_is_liveness_only(client):
+    """Unauthenticated /healthz must not leak channel or pool internals."""
     resp = await client.get("/healthz")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
+    assert set(data) == {"status", "version"}
+
+
+@pytest.mark.anyio
+async def test_health_detail_reports_channel(client):
+    resp = await client.get("/v1/health")
+    assert resp.status_code == 200
+    data = resp.json()
     assert data["channel"]["channel"] == "echo"
     assert data["channel"]["ready"] is True
 
@@ -42,7 +51,9 @@ async def test_chat_sync_echo(client):
 async def test_chat_session_resume_roundtrip(client):
     first = (await client.post("/v1/chat", json={"prompt": "one"})).json()
     second = (
-        await client.post("/v1/chat", json={"prompt": "two", "session_id": first["session_id"]})
+        await client.post(
+            "/v1/chat", json={"prompt": "two", "session_id": first["session_id"]}
+        )
     ).json()
     assert second["session_id"] == first["session_id"]
 
@@ -61,7 +72,9 @@ async def test_chat_unknown_session_404(client):
 
 @pytest.mark.anyio
 async def test_chat_rejects_bad_permission_mode(client):
-    resp = await client.post("/v1/chat", json={"prompt": "x", "permission_mode": "chaos"})
+    resp = await client.post(
+        "/v1/chat", json={"prompt": "x", "permission_mode": "chaos"}
+    )
     assert resp.status_code == 422  # pydantic Literal validation
 
 
@@ -87,10 +100,16 @@ async def test_chat_stream_emits_normalized_frames(client):
 
 @pytest.mark.anyio
 async def test_stream_session_reuse_across_calls(client):
-    first = parse_sse((await client.post("/v1/chat/stream", json={"prompt": "s1"})).text)
+    first = parse_sse(
+        (await client.post("/v1/chat/stream", json={"prompt": "s1"})).text
+    )
     sid = first[0]["session_id"]
     second = parse_sse(
-        (await client.post("/v1/chat/stream", json={"prompt": "s2", "session_id": sid})).text
+        (
+            await client.post(
+                "/v1/chat/stream", json={"prompt": "s2", "session_id": sid}
+            )
+        ).text
     )
     assert second[0]["session_id"] == sid
 

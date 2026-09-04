@@ -7,12 +7,14 @@ import time
 
 import pytest
 
+import sub2api.core.pool as pool_mod
 from sub2api.core.pool import (
     AccountConfig,
     AccountPool,
     PoolConfig,
     load_pool_config,
 )
+from sub2api.core.store import Store
 
 
 # -- helpers -----------------------------------------------------------------
@@ -309,3 +311,323 @@ async def test_reconfigure_preserves_dead_state_for_unchanged_accounts():
     assert b.dead_reason == ""
     assert b.disabled_until == 0.0
     await pool.close()
+
+
+# -- cache affinity ----------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_affinity_reuses_the_same_slot_for_the_same_key():
+    """Upstream prompt caching is per account, so a known prefix must go back
+    to the account that already holds it."""
+    pool = _pool(3, max_concurrent=2)
+    await pool.start()
+    first = await pool.acquire("key-a")
+    await pool.release(first)
+    for _ in range(5):
+        again = await pool.acquire("key-a")
+        assert again is first
+        await pool.release(again)
+    assert pool.overflow_count == 0
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_affinity_keys_spread_across_accounts():
+    pool = _pool(3, max_concurrent=2)
+    await pool.start()
+    a = await pool.acquire("key-a")
+    b = await pool.acquire("key-b")
+    assert a is not b
+    await pool.release(a)
+    await pool.release(b)
+    assert await pool.acquire("key-b") is b
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_affinity_overflows_when_bound_slot_is_saturated():
+    pool = _pool(2, max_concurrent=1)
+    await pool.start()
+    bound = await pool.acquire("key-a")  # binds and saturates it
+    other = await pool.acquire("key-a")  # same key, no capacity left
+    assert other is not bound
+    assert pool.overflow_count == 1
+    await pool.release(bound)
+    await pool.release(other)
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_affinity_overflows_away_from_a_dead_account():
+    pool = _pool(2, max_concurrent=2)
+    await pool.start()
+    bound = await pool.acquire("key-a")
+    await pool.release(bound)
+    bound.dead_reason = "user_banned"
+    moved = await pool.acquire("key-a")
+    assert moved is not bound
+    assert pool.overflow_count == 1
+    # The key is rebound to the account that actually served it.
+    await pool.release(moved)
+    assert await pool.acquire("key-a") is moved
+    assert pool.overflow_count == 1
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_affinity_overflows_away_from_a_usage_limited_account():
+    pool = _pool(2, max_concurrent=2)
+    await pool.start()
+    bound = await pool.acquire("key-a")
+    await pool.release(bound)
+    bound.usage_limited = True
+    moved = await pool.acquire("key-a")
+    assert moved is not bound
+    assert pool.overflow_count == 1
+    await pool.release(moved)
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_affinity_binding_expires_after_the_cache_ttl():
+    pool = _pool(2, max_concurrent=2)
+    await pool.start()
+    bound = await pool.acquire("key-a")
+    await pool.release(bound)
+    # Age the binding past the longest upstream cache TTL.
+    session_id, bound_at = pool._affinity["key-a"]
+    pool._affinity["key-a"] = (session_id, bound_at - pool_mod.AFFINITY_TTL_SECONDS - 1)
+    await pool.release(await pool.acquire("key-a"))
+    # Expiry is not an overflow: nothing was wrong with the account.
+    assert pool.overflow_count == 0
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_affinity_map_is_lru_capped():
+    pool = _pool(1, max_concurrent=1)
+    await pool.start()
+    for i in range(pool_mod.AFFINITY_MAX_ENTRIES + 10):
+        await pool.release(await pool.acquire(f"key-{i}"))
+    assert len(pool._affinity) == pool_mod.AFFINITY_MAX_ENTRIES
+    assert "key-0" not in pool._affinity
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_reconfigure_clears_affinity():
+    pool = _pool(2)
+    await pool.start()
+    await pool.release(await pool.acquire("key-a"))
+    assert await pool.reconfigure(
+        PoolConfig(accounts=[AccountConfig(token="new", session_id="new-sid")])
+    )
+    assert pool._affinity == {}
+    await pool.close()
+
+
+# -- selection safety --------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_dead_account_is_never_preferred_over_a_cooling_one():
+    """Routing to a banned account is a guaranteed failure; a cooling account
+    at least might work."""
+    pool = _pool(2, max_concurrent=1)
+    await pool.start()
+    dead, cooling = pool.slots
+    dead.dead_reason = "user_banned"
+    cooling.disabled_until = time.monotonic() + 60.0
+    slot = await pool.acquire()
+    assert slot is cooling
+    await pool.release(slot)
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_usage_limited_slot_is_last_resort():
+    pool = _pool(2, max_concurrent=4)
+    await pool.start()
+    limited, ok = pool.slots
+    limited.usage_limited = True
+    for _ in range(4):
+        assert await pool.acquire() is ok
+    # Only the out-of-credit account has capacity left now.
+    assert await pool.acquire() is limited
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_all_dead_still_fails_open():
+    pool = _pool(2, max_concurrent=1)
+    await pool.start()
+    for i, s in enumerate(pool.slots):
+        s.dead_reason = "user_banned"
+        s.disabled_until = time.monotonic() + 60.0 * (2 - i)
+    slot = await pool.acquire()
+    assert slot is pool.slots[1]  # earliest recovery
+    await pool.release(slot)
+    await pool.close()
+
+
+# -- cooldown escalation -----------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_cooldown_doubles_on_each_consecutive_arming():
+    pool = _pool(1, max_concurrent=5, max_failures=1, cooldown=10.0)
+    await pool.start()
+    slot = pool.slots[0]
+
+    await pool.release(slot, success=False)
+    first = slot.disabled_until - time.monotonic()
+    assert slot.cooldown_strikes == 1
+    assert 9.0 < first <= 10.0  # first arming is the base cooldown
+
+    await pool.release(slot, success=False)
+    second = slot.disabled_until - time.monotonic()
+    assert slot.cooldown_strikes == 2
+    assert 19.0 < second <= 20.0
+
+    await pool.release(slot, success=False)
+    third = slot.disabled_until - time.monotonic()
+    assert slot.cooldown_strikes == 3
+    assert 39.0 < third <= 40.0
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_cooldown_backoff_is_capped():
+    pool = _pool(1, max_concurrent=5, max_failures=1, cooldown=1.0)
+    await pool.start()
+    slot = pool.slots[0]
+    for _ in range(8):
+        await pool.release(slot, success=False)
+    assert slot.cooldown_strikes == 8
+    capped = slot.disabled_until - time.monotonic()
+    assert 15.0 < capped <= 16.0  # 2 ** MAX_COOLDOWN_DOUBLINGS
+    await pool.close()
+
+
+@pytest.mark.anyio
+async def test_success_resets_cooldown_escalation():
+    pool = _pool(1, max_concurrent=5, max_failures=1, cooldown=10.0)
+    await pool.start()
+    slot = pool.slots[0]
+    await pool.release(slot, success=False)
+    await pool.release(slot, success=False)
+    assert slot.cooldown_strikes == 2
+    await pool.release(slot, success=True)
+    assert slot.cooldown_strikes == 0
+    slot.disabled_until = 0.0
+    await pool.release(slot, success=False)
+    assert 9.0 < slot.disabled_until - time.monotonic() <= 10.0
+    await pool.close()
+
+
+# -- semaphore resizing ------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_reconfigure_resizes_capacity_without_replacing_the_semaphore():
+    """Replacing the semaphore object would orphan any waiter parked on the
+    old one; resizing keeps a single object for the pool's lifetime."""
+    pool = _pool(1, max_concurrent=1)
+    await pool.start()
+    original = pool._global_sem
+
+    assert await pool.reconfigure(
+        PoolConfig(
+            accounts=[AccountConfig(token="t", session_id="s", max_concurrent=3)]
+        )
+    )
+    assert pool._global_sem is original
+    assert pool._sem_permits == 3
+    slots = [await pool.acquire() for _ in range(3)]
+    assert all(s is pool.slots[0] for s in slots)
+    for s in slots:
+        await pool.release(s)
+
+    assert await pool.reconfigure(
+        PoolConfig(
+            accounts=[AccountConfig(token="t", session_id="s", max_concurrent=1)]
+        )
+    )
+    assert pool._global_sem is original
+    assert pool._sem_permits == 1
+    held = await pool.acquire()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(pool.acquire(), timeout=0.05)
+    await pool.release(held)
+    await pool.close()
+
+
+# -- DB-backed config --------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_load_pool_config_prefers_db_over_accounts_json(monkeypatch, tmp_path):
+    monkeypatch.delenv("SUB2API_ACCOUNTS", raising=False)
+    db = tmp_path / "sub2api.sqlite3"
+    store = Store(db)
+    await store.import_accounts(
+        {
+            "strategy": "least-connections",
+            "max_failures": 7,
+            "cooldown_seconds": 12.5,
+            "accounts": [
+                {"session_id": "db-a", "token": "tok-db-a", "max_concurrent": 2},
+                {"session_id": "db-b", "token": "tok-db-b", "max_concurrent": 3},
+            ],
+        }
+    )
+    await store.close()
+
+    json_file = tmp_path / "accounts.json"
+    json_file.write_text(
+        '{"accounts":[{"token":"tok-file","session_id":"file-a"}]}', encoding="utf-8"
+    )
+
+    cfg = load_pool_config(path=json_file, db_path=db)
+    assert cfg is not None
+    assert [a.session_id for a in cfg.accounts] == ["db-a", "db-b"]
+    assert cfg.strategy == "least-connections"
+    assert cfg.max_failures == 7
+    assert cfg.cooldown_seconds == 12.5
+
+
+@pytest.mark.anyio
+async def test_load_pool_config_skips_dead_db_rows(monkeypatch, tmp_path):
+    monkeypatch.delenv("SUB2API_ACCOUNTS", raising=False)
+    db = tmp_path / "sub2api.sqlite3"
+    store = Store(db)
+    await store.upsert_account("live", "tok-live", status="ok")
+    await store.upsert_account("gone", "tok-gone", status="dead")
+    await store.close()
+
+    cfg = load_pool_config(path=tmp_path / "missing.json", db_path=db)
+    assert cfg is not None
+    assert [a.session_id for a in cfg.accounts] == ["live"]
+
+
+def test_load_pool_config_env_still_wins_over_db(monkeypatch, tmp_path):
+    db = tmp_path / "sub2api.sqlite3"
+    Store(db)
+    monkeypatch.setenv("SUB2API_ACCOUNTS", '{"accounts":[{"token":"env-tok"}]}')
+    cfg = load_pool_config(db_path=db)
+    assert cfg is not None
+    assert cfg.accounts[0].token == "env-tok"
+
+
+def test_load_pool_config_falls_back_to_file_when_db_is_empty(monkeypatch, tmp_path):
+    monkeypatch.delenv("SUB2API_ACCOUNTS", raising=False)
+    db = tmp_path / "sub2api.sqlite3"
+    Store(db)  # schema only, no accounts
+    json_file = tmp_path / "accounts.json"
+    json_file.write_text(
+        '{"accounts":[{"token":"tok-file","session_id":"file-a"}]}', encoding="utf-8"
+    )
+    cfg = load_pool_config(path=json_file, db_path=db)
+    assert cfg is not None
+    assert cfg.accounts[0].token == "tok-file"

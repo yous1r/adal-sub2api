@@ -17,9 +17,12 @@ class AppSettings:
     channel: str = "echo"
     host: str = "127.0.0.1"
     port: int = 8080
-    api_key: str | None = None                  # Bearer guard for /v1/* when set
-    openai_permission_mode: str = "yolo"        # headless callers cannot approve tools
+    api_key: str | None = None  # Bearer guard for /v1/* when set
+    openai_permission_mode: str = "yolo"  # headless callers cannot approve tools
     enabled_tools: tuple[str, ...] | None = None  # deployment-wide tool whitelist
+    proxy: str | None = None  # outbound HTTP(S) proxy for upstream
+    web: bool = False  # mount the /admin management UI
+    db: str | None = None  # SQLite path override (else SUB2API_DB)
     channel_config: ChannelConfig = field(default_factory=ChannelConfig)
 
     @classmethod
@@ -38,12 +41,18 @@ class AppSettings:
             host=env.get(f"{ENV_PREFIX}HOST", "127.0.0.1"),
             port=int(env.get(f"{ENV_PREFIX}PORT", "8080")),
             api_key=env.get(f"{ENV_PREFIX}API_KEY") or None,
-            openai_permission_mode=env.get(f"{ENV_PREFIX}OPENAI_PERMISSION_MODE", "yolo"),
+            openai_permission_mode=env.get(
+                f"{ENV_PREFIX}OPENAI_PERMISSION_MODE", "yolo"
+            ),
             enabled_tools=enabled_tools,
+            proxy=env.get(f"{ENV_PREFIX}PROXY") or None,
+            web=env.get(f"{ENV_PREFIX}WEB", "") == "1",
+            db=env.get(f"{ENV_PREFIX}DB") or None,
             channel_config=ChannelConfig(
                 workspace=env.get(f"{ENV_PREFIX}WORKSPACE", "."),
                 auth_token=env.get(f"{ENV_PREFIX}AUTH_TOKEN"),
                 runtime_path=env.get(f"{ENV_PREFIX}RUNTIME_PATH"),
+                proxy=env.get(f"{ENV_PREFIX}PROXY") or None,
                 options=options,
             ),
         )

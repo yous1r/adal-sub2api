@@ -1,8 +1,11 @@
 """Tests for the subscription-usage feature (GET /v1/usage).
 
-The AdaL platform publishes live credits at two unauthenticated,
-clerk-id-keyed endpoints; every network call here is served by an
-``httpx.MockTransport`` so the suite stays offline.
+The AdaL platform publishes live credits at two clerk-id-keyed endpoints;
+every network call here is served by an ``httpx.MockTransport`` so the suite
+stays offline.  The mock reproduces one measured access rule exactly:
+``/api/user/by-clerk-id/{id}`` answers 403 ``Cannot query other users`` when
+the request carries a bearer belonging to a *different* account, which is how
+a pool account's credits silently read zero.
 """
 
 from __future__ import annotations
@@ -49,6 +52,14 @@ def _token(clerk_id: str = CLERK_ID, *, ttl: int = 3600) -> str:
     return _jwt({"sub": clerk_id, "sid": "sess_x", "exp": int(time.time()) + ttl})
 
 
+def _bearer_subject(request: httpx.Request) -> str:
+    """The ``sub`` claim of the request's bearer, or ``""`` when anonymous."""
+    header = request.headers.get("authorization", "")
+    if not header.startswith("Bearer "):
+        return ""
+    return clerk_id_from_token(header.removeprefix("Bearer "))
+
+
 def _platform_handler(
     *,
     users: dict[str, dict] | None = None,
@@ -86,7 +97,18 @@ def _platform_handler(
                 return httpx.Response(500, text="boom")
             return httpx.Response(200, json={"tiers": tiers})
         if path.startswith("/api/user/by-clerk-id/"):
-            user = users.get(path.rsplit("/", 1)[-1])
+            wanted = path.rsplit("/", 1)[-1]
+            bearer = _bearer_subject(request)
+            if bearer and bearer != wanted:
+                # Measured verbatim from the live platform.
+                return httpx.Response(
+                    403,
+                    json={
+                        "error_type": "auth_forbidden",
+                        "message": "Cannot query other users",
+                    },
+                )
+            user = users.get(wanted)
             if user is None:
                 return httpx.Response(404, json={"detail": "Not Found"})
             return httpx.Response(200, json=user)
@@ -171,6 +193,52 @@ async def test_fetch_account_quota_survives_transport_error():
         row = await fetch_account_quota(c, _token())
     assert row["ok"] is False
     assert "user lookup failed" in row["error"]
+
+
+@pytest.mark.anyio
+async def test_fetch_account_quota_authenticates_as_its_own_account():
+    """The lookup must carry the queried account's own bearer.
+
+    A shared ``httpx.AsyncClient`` may already hold a different account's
+    ``Authorization`` (single-account mode sets it on the client), and the
+    platform answers 403 ``Cannot query other users`` in that case — which
+    previously zeroed a freshly imported account's credits.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization", ""))
+        return _platform_handler()(request)
+
+    token = _token()
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": f"Bearer {_token('user_someone_else')}"},
+    )
+    async with client as c:
+        row = await fetch_account_quota(c, token)
+
+    assert row["ok"] is True  # the client-level alien bearer was overridden
+    assert seen and all(h == f"Bearer {token}" for h in seen)
+
+
+@pytest.mark.anyio
+async def test_fetch_account_quota_surfaces_a_cross_account_denial():
+    """A 403 is reported as an error, never rendered as zero credits."""
+
+    def forbidden(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "error_type": "auth_forbidden",
+                "message": "Cannot query other users",
+            },
+        )
+
+    async with _mock_client(forbidden) as c:
+        row = await fetch_account_quota(c, _token())
+    assert row["ok"] is False
+    assert row["error"] == "user lookup failed: HTTP 403"
 
 
 @pytest.mark.anyio
@@ -381,6 +449,60 @@ async def test_channel_usage_without_credentials_is_invalid():
     payload = await ch.usage()
     assert payload["isValid"] is False
     assert payload["invalidMessage"] == "no adal account configured"
+    await ch.close()
+
+
+@pytest.mark.anyio
+async def test_channel_usage_after_import_resolves_the_new_account(monkeypatch):
+    """Importing an account into a single-account channel must not zero credits.
+
+    Reproduces the live failure: the process starts with the creds-file
+    account (whose bearer is pinned on the shared client), an operator pastes
+    a *different* account, and ``refresh()`` promotes the channel to pool
+    mode.  Every account-scoped lookup must then authenticate as the account
+    being queried, not as the one the client header still names.
+    """
+    imported = "user_imported"
+    users = {
+        CLERK_ID: {"id": USER_UUID, "email": "old@b.c"},
+        imported: {"id": "uuid-new", "email": "new@b.c"},
+    }
+    subs = {
+        USER_UUID: {"tier": "pro", "monthly_credits": 30.0, "credits_remaining": 26.0},
+        "uuid-new": {
+            "tier": "pro",
+            "status": "trialing",
+            "monthly_credits": 80.0,
+            "credits_used_this_period": 0.0,
+            "credits_remaining": 80.0,
+        },
+    }
+    old_token = _token()
+    ch = mod.AdalCloudChannel(ChannelConfig())
+    ch._started = True
+    ch._token = old_token
+    # Exactly what _start() builds in single-account mode.
+    ch._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_platform_handler(users=users, subs=subs)),
+        headers={"Authorization": f"Bearer {old_token}"},
+    )
+    new_cfg = PoolConfig(
+        accounts=[AccountConfig(token=_token(imported), session_id="sid-new")]
+    )
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *a: {})
+    monkeypatch.setattr(mod, "load_pool_config", lambda: new_cfg)
+    monkeypatch.setattr(mod, "register_session", lambda **kw: None)
+
+    await ch.refresh()
+
+    # The promoted client no longer speaks for the old account.
+    assert "authorization" not in ch._client.headers
+    payload = await ch.usage()
+    assert payload["isValid"] is True
+    assert payload["remaining"] == 80.0
+    assert payload["sub2api"]["pool_enabled"] is True
+    assert payload["sub2api"]["detail"][0]["email"] == "new@b.c"
+    await ch._pool.close()
     await ch.close()
 
 

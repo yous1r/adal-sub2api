@@ -1,26 +1,29 @@
 # sub2api
 
-把 AI 编码代理的**订阅额度**包装成统一的 **HTTP API**。首个渠道是 [AdaL](https://docs.sylph.ai/)（headless CLI / Python SDK 两种接入方式），通过渠道适配器抽象，新渠道（Claude Code、Codex CLI 等）可以零改动服务端地快速接入。
+把 AI 编码代理的**订阅额度**包装成统一的 **HTTP API**。首个渠道是 [AdaL](https://docs.sylph.ai/)（云端代理 / headless CLI / Python SDK 三种接入方式），通过渠道适配器抽象，新渠道（Claude Code、Codex CLI 等）可以零改动服务端地快速接入。除协议翻译外，sub2api 还负责上游兼容层（净化 Claude Code 等真实客户端的请求，把"一次成功后连续 500"变成稳定可用）、账号池调度、本地用量与成本计量，以及 `--web` 管理界面。
 
 ## 架构
 
 ```text
-            HTTP 客户端
-                │
-   POST /v1/chat        POST /v1/chat/stream (SSE)
-                │
-┌───────────────────────────────────────────────┐
-│  server/app.py —— 只认识归一化契约             │
-│  公共逻辑: 会话管理 · 错误映射 · 聚合 · SSE     │
-└───────────────┬───────────────────────────────┘
-                │ ChatRequest ↓ / Event 流 ↑
-┌───────────────┴───────────────────────────────┐
-│  core/channel.BaseChannel（抽象基类）          │
-│  公共管线: 懒启动 · 异常→TurnFailed 归一化      │
-└───┬───────────────┬───────────────┬──────────────┬───────────┐
-    │               │               │              │           │
- echo           adal-cli        adal-sdk      adal-backend  adal-cloud
-(参考实现)   (子进程+NDJSON)  (Python SDK)  (本地后端HTTP) (远程代理·无需adal)
+                              HTTP 客户端
+                                   │
+        ┌──────────────────────────┴───────────────────────────┐
+        │ server/routes/*  —— 每个模块一个 router(ctx)          │
+        │ anthropic · openai_compat · responses · models        │
+        │ usage · chat · admin · web(--web)                     │
+        └───────────┬──────────────────────────┬───────────────┘
+                    │ 原生透传                 │ 归一化事件
+        ┌───────────┴────────────┐   ┌─────────┴──────────────┐
+        │ compat/ 兼容层         │   │ core/channel.BaseChannel│
+        │ sanitize  请求净化     │   │ 懒启动 · 异常→TurnFailed│
+        │ aggregate 流式聚合     │   └─────────┬──────────────┘
+        │ errors    错误还原     │             │
+        │ affinity  缓存亲和     │   echo · adal-cli · adal-sdk
+        └───────────┬────────────┘        · adal-backend
+                    │
+        server/proxy.py  转发 · 401 重铸 · UsageMeter 计量
+                    │
+        api.adal.sylph.ai/proxy/*  →  Anthropic / OpenAI / zai / …
 ```
 
 **`adal-cloud`（推荐）**：直接调用 AdaL 托管代理 `api.adal.sylph.ai/proxy/*`，
@@ -37,18 +40,32 @@ Clerk JWT（`adal` 登录或内置设备码 OAuth 流），之后 Pi / Claude Co
 python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"   # Windows
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"       # macOS/Linux
 
-# 启动（默认 echo 渠道，无需任何外部依赖）
-sub2api --port 8080
-# 或: python -m sub2api --port 8080
+# 启动需要 API key —— 不设 key 的网关等于把订阅额度公开给任何能连上端口的人
+SUB2API_API_KEY=sk-sub2api-secret sub2api --port 8080
+# 或: SUB2API_API_KEY=sk-sub2api-secret python -m sub2api --port 8080
+# 明确要开放时: SUB2API_ALLOW_ANONYMOUS=1 python -m sub2api
 
-# 切换到 adal-cloud 渠道（推荐，无需安装 adal CLI；首次会触发设备码登录）
-SUB2API_CHANNEL=adal-cloud python -m sub2api
+# adal-cloud 渠道（推荐，无需安装 adal CLI；首次会触发设备码登录）
+SUB2API_API_KEY=sk-sub2api-secret python -m sub2api --channel adal-cloud
 # 若已用 `adal` 登录过，直接复用 ~/.adal/adal_oauth_creds.json；
-# 或显式注入 token: SUB2API_AUTH_TOKEN=<jwt> SUB2API_CHANNEL=adal-cloud python -m sub2api
+# 或显式注入 token: SUB2API_AUTH_TOKEN=<jwt>
 
-# 切换到 AdaL 渠道（需先安装并登录 AdaL CLI：adal）
-SUB2API_CHANNEL=adal-cli python -m sub2api
+# 全量开启：管理界面 + 计量库
+SUB2API_API_KEY=sk-sub2api-secret python -m sub2api \
+  --channel adal-cloud --port 8080 --web --db ./sub2api.sqlite3
+
+# 本地 AdaL CLI 渠道（需先安装并登录 adal）
+SUB2API_API_KEY=sk-sub2api-secret python -m sub2api --channel adal-cli
 ```
+
+PowerShell：
+
+```powershell
+$env:SUB2API_API_KEY="sk-sub2api-secret"
+python -m sub2api --channel adal-cloud --port 8080 --web
+```
+
+加账号最省事的方式是开着 `--web` 打开 `http://127.0.0.1:8080/admin`，在「一键导入账号」里**粘贴任意含 token 的内容**（裸 JWT、`~/.adal/adal_oauth_creds.json` 全文、`accounts.json` 条目都行），或点「开始设备码登录」——详见「[一键导入账号](#一键导入账号只输入一个值)」。
 
 ## OpenAI 兼容接口（可接入 cliproxyapi 等聚合器）
 
@@ -60,10 +77,11 @@ SUB2API_CHANNEL=adal-cli python -m sub2api
 | `POST /v1/responses` | OpenAI Responses API（`adal-cloud` 透传）：`input` / `model` / `stream` / `reasoning` / `background` 原样透传，SSE 事件 `response.created` → `response.completed` |
 | `GET /v1/responses/{id}` | 获取/轮询已创建的 response 对象（后台推理模式） |
 | `DELETE /v1/responses/{id}` | 删除已存储的 response 对象 |
-| `GET /v1/models` | OpenAI 格式模型列表（来自当前渠道的 `models` 声明） |
+| `GET /v1/models` | OpenAI 格式模型列表。`adal-cloud` 下只列**已验证可达**的目录模型（当前 31 个），不列出无法路由的条目 |
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-sub2api-secret" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
@@ -73,7 +91,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - `messages` 摊平成单轮 prompt：单条 user 消息取原文；多角色历史转为 `[SYSTEM]/[USER]/[ASSISTANT]` 标记文本（渠道按一次性请求消费）。
 - 思考增量（`thought.delta`）映射为 DeepSeek 风格的 `delta.reasoning_content`；工具事件不透传。
 - 流中失败：终帧附 `error` 对象后正常收尾 `[DONE]`；非流失败返回 OpenAI 错误形状 `{"error":{"message","type","code"}}`。
-- 该路由的权限模式由 `SUB2API_OPENAI_PERMISSION_MODE` 控制（默认 `yolo`——headless 调用方无法批准工具确认）。**公网部署务必配合 `SUB2API_API_KEY` 与 `SUB2API_ENABLED_TOOLS` 白名单收敛风险。**
+- 该路由的权限模式由 `SUB2API_OPENAI_PERMISSION_MODE` 控制（默认 `yolo`——headless 调用方无法批准工具确认）。鉴权默认强制（无 `SUB2API_API_KEY` 时进程拒绝启动）；**公网部署另需 `SUB2API_ENABLED_TOOLS` 白名单收敛工具风险。**
 
 ### 原生透传（`adal-cloud` 渠道）
 
@@ -81,23 +99,31 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | 端点 | 协议 | 透传到 |
 |---|---|---|
-| `POST /v1/messages` | Anthropic Messages API | `api.adal.sylph.ai/proxy/v1/messages`（X-Target-URL=api.anthropic.com） |
-| `POST /v1/chat/completions` | OpenAI Chat Completions | `api.adal.sylph.ai/proxy/v1/chat/completions`（X-Target-URL 按 model 推断，默认 OpenAI） |
-| `POST /v1/responses` | OpenAI Responses API | `api.adal.sylph.ai/proxy/v1/responses`（X-Target-URL 按 model 推断，默认 OpenAI） |
+| `POST /v1/messages` | Anthropic Messages API | `proxy/v1/messages`；`X-Target-URL` 按 model 的 provider 解析（`anthropic` / `zai` / `minimax` / `xai`） |
+| `POST /v1/messages/count_tokens` | Anthropic Token Counting | 上游拒绝该路径，sub2api 用 `max_tokens: 1` 探针实现，回报 `{"input_tokens": N}` |
+| `POST /v1/chat/completions` | OpenAI Chat Completions | `proxy/v1/chat/completions`；`X-Target-URL` 按 model 推断，默认 OpenAI |
+| `POST /v1/responses` | OpenAI Responses API | `proxy/v1/responses`；`X-Target-URL` 按 model 推断，默认 OpenAI |
 | `GET /v1/responses/{id}` | OpenAI Responses API | 轮询/获取已创建的 response 对象 |
 | `DELETE /v1/responses/{id}` | OpenAI Responses API | 删除已存储的 response 对象 |
-| `GET /v1/usage` | sub2api 自有 | `adal.sylph.ai/api/subscription/user/{id}`（订阅额度查询，见下文 cc-switch 集成） |
+| `GET /v1/usage` | sub2api 自有 | 云端订阅额度 + 本地 24h 计量（见下文 cc-switch 集成） |
+| `GET /v1/health` | sub2api 自有 | 渠道详情：账号池内部状态、prompt cache、token 存在性（需鉴权） |
 
 CLIProxyAPI（同时支持 OpenAI 和 Anthropic 上游）可直接把 sub2api 配为上游，无需 SSE 解析。Claude Code 也可直连 `/v1/messages`：
 
 ```bash
-# Anthropic 原生（Claude Code）
+# Anthropic 原生（Claude Code / Anthropic SDK）
 curl http://127.0.0.1:8080/v1/messages \
+  -H "Authorization: Bearer sk-sub2api-secret" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'
-```
 
-curl http://127.0.0.1:48080/v1/messages -H "Authorization: Bearer sk-sub2api-secret" -H "Content-Type: application/json" -d '{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'
+# Token 计数（Claude Code 会在每轮前调用）
+curl http://127.0.0.1:8080/v1/messages/count_tokens \
+  -H "Authorization: Bearer sk-sub2api-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}'
+# → {"input_tokens": 8}
+```
 
 ```bash
 # OpenAI Responses API（现代端点，支持 reasoning/background/stream）
@@ -119,12 +145,49 @@ curl http://127.0.0.1:8080/v1/responses/resp_abc123 \
 
 **注**：归一化事件层（`text.delta`/`thought.delta`/`tool.*`）仅对 `echo`/`adal-cli`/`adal-sdk`/`adal-backend` 等需要翻译的渠道生效；`adal-cloud` 走透传路径时不经过该层。
 
+### 上游兼容层（`adal-cloud` 渠道）
+
+云端代理是一层**路径绑定的 SDK 包装**，对请求体的容忍度远低于官方 API。未经处理直连时
+Claude Code 的典型表现是：**一次流式 200，随后一片 HTTP 500**。`sub2api/compat/` 专治这些
+差异，每条规则都由真实上游拒绝报文反推得到（见 `compat/profiles.py` 的注释）。
+
+**1. 请求净化（`compat/sanitize.py`）** —— 按协议分流，删除或改写上游 SDK 不接受的字段：
+
+| 协议 | 处理 |
+|---|---|
+| Anthropic | 删除 `context_management`、`mcp_servers`、`betas`、`stream_options`、`n`、`seed`、`user`、`response_format`、`logit_bias`、`top_logprobs`、`system_prompt`、`max_completion_tokens`、`parallel_tool_calls`（上游报 `unexpected keyword argument`）；删除 `service_tier`、`container`、顶层 `cache_control`（上游报 `Extra inputs are not permitted`）；`metadata` 只保留 `user_id`（`metadata.session_id` 会被拒） |
+| Anthropic（`claude-sonnet-5` / `claude-opus-5` / `claude-fable-5-1`） | 这些模型已弃用采样参数：删除 `temperature`/`top_p`/`top_k`；`thinking.type: enabled` 改写为 `adaptive`，且仅在客户端未给 `output_config` 时补 `output_config.effort: high` |
+| Anthropic（4-6 家族） | `thinking` 处于 `enabled`/`adaptive` 且 `temperature != 1` 时把 `temperature` 置 1（上游 400：`temperature` may only be set to 1 when thinking is enabled or in adaptive mode） |
+| Anthropic（工具） | 未知 `tools[].type` 降级为 `custom` 并补 `input_schema`；允许 `bash_20250124`、`memory_20250818`、`text_editor_20250728`、`tool_search_tool_bm25_20251119`、`tool_search_tool_regex_20251119` 原生透传，前三者额外校验规范工具名（`bash` / `memory` / `str_replace_based_edit_tool`） |
+| OpenAI Chat | `max_tokens` → `max_completion_tokens`；删除 `top_p`/`frequency_penalty`/`presence_penalty`/`stop`/`logprobs`/`top_logprobs`；`temperature != 1` 时删除；无 `store` 时删除 `metadata`；`response_format: {"type":"json_object"}` 而 `messages` 里没有 `json` 字样时删除（上游会拒）；带 `tools` 时强制 `reasoning_effort: "none"`（否则 400）；`stream` 时注入 `stream_options.include_usage`（唯一的流式计量途径） |
+| Responses | `max_tokens`/`max_completion_tokens` → `max_output_tokens`；`messages` → `input`；删除 `temperature`/`top_p`/`stop` |
+
+**2. 非流式 = 上游流式 + 服务端聚合（`compat/aggregate.py`）** —— 上游对 `max_tokens > 21333`
+的非流式 `/v1/messages` 直接硬 500，对请求体问题也只回不透明 500，而**同一请求的流式接口两者
+都能正常处理**。因此 `/v1/messages` 的非流式请求一律强制上游 `stream: true`，服务端把 SSE 帧
+重组成单个 JSON 信封回给客户端——客户端看到的仍是标准非流式响应，`usage`、`stop_reason`、
+`tool_use`、thinking 签名全部保留。实测 `max_tokens: 32000` 非流式 200、正常 `end_turn`、无静默截断。
+
+**3. 错误还原（`compat/errors.py`）** —— 上游把被拒请求伪装成 HTTP 200 里的 `event: error` 帧
+（原样转发的话客户端看到的是"成功但空响应"）。sub2api 提取 `error.type` 并还原成官方 API 会给的
+状态码：`invalid_request_error`→400、`authentication_error`→401、`permission_error`→403、
+`not_found_error`→404、`rate_limit_error`→429、`overloaded_error`→529，无法归类→502。同时该
+账号被标记为失败，不会污染池健康度。
+
+**4. 模型不可达 = 原生 404** —— 每个 provider 只在**实测 200** 的路径上可达（如 `zai` 只有
+`/v1/messages`，`qwen` 只有 OpenAI 两条），请求打到不支持的组合时按调用方的错误方言回 404，
+而不是转发到默认 provider 换回一个不透明 500。provider 用**最长前缀**解析，
+`chatgpt_web-gpt-5.6-luna` 不会被切成 `chatgpt` 而错发到 Anthropic 主机。
+
+**5. 缓存亲和（`compat/affinity.py`）** —— 从请求的可缓存前缀算出稳定摘要
+（`metadata.user_id` 优先），账号池据此把同一前缀调度回同一账号，命中上游 prompt cache。
+
 ### 订阅额度查询（cc-switch 集成）
 
 `adal-cloud` 渠道额外暴露 `GET /v1/usage`，直接回报 AdaL 订阅的**真实剩余额度**（美元计价的 credits），供 cc-switch 等客户端展示"用量"：
 
 ```bash
-curl http://127.0.0.1:48080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
+curl http://127.0.0.1:8080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
 ```
 
 ```json
@@ -140,6 +203,8 @@ curl http://127.0.0.1:48080/v1/usage -H "Authorization: Bearer sk-sub2api-secret
     "channel": "adal-cloud", "pool_enabled": false,
     "accounts": 1, "accounts_resolved": 1, "accounts_parked": 0,
     "queried_at": "2026-09-02T12:29:43Z",
+    "requests": 17, "tokens": 21384, "cost_usd": 0.235578,
+    "window": "24h", "rate_source": "calibrated",
     "detail": [{ "ok": true, "email": "…", "tier": "pro", "status": "trialing", "…": "…" }]
   }
 }
@@ -147,11 +212,14 @@ curl http://127.0.0.1:48080/v1/usage -H "Authorization: Bearer sk-sub2api-secret
 
 机制与语义：
 
-- 账号身份取自各 JWT 的 `sub`（Clerk user id），随后两次**匿名** GET 拿到订阅记录——**token 过期或账号被封依然能查额度**。
+- 账号身份取自各 JWT 的 `sub`（Clerk user id），随后两次 GET 拿到订阅记录——**token 过期或账号被封依然能查额度**（身份看 `sub` 声明，不验签名新鲜度）。
+- 查询**以被查账号自己的 token 认证**：`/api/user/by-clerk-id/` 允许匿名，但带上*别人*的 `Authorization` 会返回 403 `Cannot query other users`。这就是多账号池必须逐账号带 token 的原因——共享 client 上残留的旧 header 会把整池额度打成 0。
 - `total` 取订阅记录的 `monthly_credits`（**不是**套餐目录里的额定值：试用/改价账号两者会不同）；套餐目录只用于把 `tier` 翻成 `planName`。
 - 多账号池模式下，所有**解析成功**的账号额度求和（含已 park 的账号），"不可用"信号通过 `isValid` / `invalidMessage` 表达，而非把数字清零；`planName` 以 `Pro x2` 形式标注同套餐数量，`extra` 附带 park 原因。
 - 聚合结果缓存 30s、套餐目录缓存 600s，账号查询并发上限 8——定时轮询不会放大成上游请求风暴。`?refresh=1` 强制绕过缓存。
 - 额度查询**永不抛错**：上游异常降级为 `isValid: false` + `invalidMessage`，不会让端点 500。
+- `sub2api.requests` / `tokens` / `cost_usd` 是**本地计量**的滚动 24h 汇总（见「计量与成本」）。未开启计量库时这几个键**不出现**，避免把"没测量"显示成"花了 0"。
+- 合并写在 payload 的副本上：渠道会缓存云端额度 30s，原地改会把逐请求明细累积进缓存。
 - 别名：`GET /usage`、`GET /v1/v1/usage`；受 `SUB2API_API_KEY` 保护（未带 key 返回 401）。非 `adal-cloud` 渠道返回 501 `channel_not_supported`。
 
 cc-switch「用量查询 → 自定义脚本」直接粘贴（`127.0.0.1` 属 loopback，免 HTTPS 校验；同源校验因两者同为 sub2api 地址而通过）：
@@ -177,14 +245,18 @@ cc-switch「用量查询 → 自定义脚本」直接粘贴（`127.0.0.1` 属 lo
 
 当拥有多个 AdaL 订阅账号时，可以配置账号池实现**高并发调度**与**资源共享**。账号池支持：
 
-- **轮询（round-robin）/ 最少连接（least-connections）**两种调度策略
+- **缓存亲和优先**：同一可缓存前缀回到同一账号（上游 prompt cache 按账号而非会话生效，缓存读比新输入便宜约 10 倍）；绑定超过上游最长缓存 TTL 后失效
+- **轮询（round-robin）/ 最少连接（least-connections）**两种兜底调度策略
 - 每账号独立**并发上限**，总并发由所有账号上限之和决定
-- **健康追踪**：连续失败达阈值后自动冷却该账号，冷却期满自动恢复
+- **健康追踪**：连续失败达阈值后冷却该账号，重复冷却按 `2^n` 指数退避，成功一次即清零
+- **额度耗尽感知**：额度同步发现 `is_usage_limited` 的账号直接不参与调度（能认证但每个请求都会因欠额被拒）
 - **故障降级**：所有账号都在冷却时 fail-open，选择最早恢复的账号
 
 #### 配置方式
 
-通过环境变量 `SUB2API_ACCOUNTS` 传入 JSON，或放置配置文件 `~/.adal/accounts.json`：
+> 不想手写 JSON、也不知道去哪里找 token？开 `--web` 用「[一键导入账号](#一键导入账号只输入一个值)」——粘贴任意含 token 的内容，或走设备码登录，一个输入框搞定，其余字段全部自动推导。
+
+按优先级解析：环境变量 `SUB2API_ACCOUNTS`（JSON）→ SQLite 账号库（`--web` 界面写入的就是这里，只读探测、不会创建库）→ 配置文件 `~/.adal/accounts.json`：
 
 ```json
 {
@@ -207,18 +279,20 @@ cc-switch「用量查询 → 自定义脚本」直接粘贴（`127.0.0.1` 属 lo
 | `accounts[].token` | — | 账号的 Clerk JWT |
 | `accounts[].session_id` | 自动生成 | 代理会话 ID，留空则自动生成 |
 | `accounts[].max_concurrent` | `4` | 该账号最大并发请求数 |
+| `accounts[].cookies` | — | Clerk cookies，用于 token 过期后自动重铸 bearer |
 
 ```bash
 # 环境变量方式
-SUB2API_ACCOUNTS='{"strategy":"round-robin","accounts":[{"token":"jwt-a"},{"token":"jwt-b"}]}' \
-  SUB2API_CHANNEL=adal-cloud python -m sub2api
+SUB2API_API_KEY=sk-sub2api-secret \
+  SUB2API_ACCOUNTS='{"strategy":"round-robin","accounts":[{"token":"jwt-a"},{"token":"jwt-b"}]}' \
+  python -m sub2api --channel adal-cloud
 
 # 或文件方式
 echo '{"accounts":[{"token":"jwt-a"},{"token":"jwt-b"}]}' > ~/.adal/accounts.json
-SUB2API_CHANNEL=adal-cloud python -m sub2api
+SUB2API_API_KEY=sk-sub2api-secret python -m sub2api --channel adal-cloud
 ```
 
-未配置账号池时，自动退化为单账号模式（使用 `SUB2API_AUTH_TOKEN` 或 `~/.adal/adal_oauth_creds.json`）。账号池文件变化会在后续模型、聊天或健康请求前安全重载；池状态可通过 `/healthz` 的 `channel.pool` 字段查看，其中 `healthy_accounts`、`available_capacity` 和 `models_available` 反映当前可用性。
+未配置账号池时，自动退化为单账号模式（使用 `SUB2API_AUTH_TOKEN` 或 `~/.adal/adal_oauth_creds.json`）。账号池文件变化会在后续模型、聊天或健康请求前安全重载。池状态在**已鉴权**的 `GET /v1/health` 的 `channel.pool` 字段下查看（`healthy_accounts`、`available_capacity`、`models_available`、每账号的 `usage_limited` / `cooldown_strikes` / `dead_reason`）；`/healthz` 只做存活探针，不暴露这些内部信息。
 
 ### Prompt Cache 自动注入（`adal-cloud` 渠道）
 
@@ -232,9 +306,111 @@ sub2api 自动为透传请求注入 **prompt cache** 标记，利用上游提供
 **行为**：
 - 仅当客户端**未发送** `cache_control` / `prompt_cache_key` 时才注入（幂等，不影响 Claude Code 等原生支持缓存的客户端）
 - 字符串格式的 `system` 会被转换为 `[{"type":"text","text":..., "cache_control":{"type":"ephemeral"}}]`
-- 缓存命中需要 system prompt ≥ 1024 tokens（Anthropic）或 input ≥ 1024 tokens（OpenAI）
+- 缓存命中需要 system prompt ≥ 1024 tokens（Anthropic）或 input ≥ 1024 tokens（OpenAI）；注入本身无长度阈值
 
-`/healthz` 的 `channel.prompt_cache` 字段可查看注入状态。
+`GET /v1/health` 的 `channel.prompt_cache` 字段可查看注入状态。命中需要 system prompt ≥ 1024 tokens（实测 2522 tokens 的提示词：首次 `cache_creation_input_tokens: 2522`，二次 `cache_read_input_tokens: 2522`）。
+
+### 管理界面（`--web`）
+
+`--web`（或 `SUB2API_WEB=1`）在**同一端口**挂载 `/admin` 管理界面——单页 HTML，无外部依赖、无构建步骤。
+
+```bash
+SUB2API_API_KEY=sk-sub2api-secret python -m sub2api \
+  --channel adal-cloud --port 8080 --web --db ./sub2api.sqlite3
+# → http://127.0.0.1:8080/admin
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /admin` | 管理页面本身（**不鉴权**：页面不含任何数据，key 在浏览器里输入并存于 `sessionStorage`） |
+| `GET /admin/api/accounts` | 账号列表，`token` 只回长度+尾 4 位，`cookies` 只回条数 |
+| `POST /admin/api/accounts` | 新增/更新账号（要求 `session_id` + `token`） |
+| `POST /admin/api/accounts/paste` | **一键导入**：`{"text": "<任意含 token 的内容>"}`，其余字段全部自动推导 |
+| `PATCH /admin/api/accounts/{sid}` | 局部更新（如只改 `max_concurrent`，不会擦掉 token） |
+| `DELETE /admin/api/accounts/{sid}` | 删除账号 |
+| `POST /admin/api/accounts/import` | 导入 `accounts.json` 格式的批量账号 |
+| `GET /admin/api/accounts/export` | 导出，与导入格式**逐字节往返一致** |
+| `GET /admin/api/accounts/{sid}/quota` | 查该账号的实时额度 |
+| `POST /admin/api/device/start` | 发起设备码登录，返回 `flow_id` / `verification_url` / `user_code`（**不返回 `device_code`**） |
+| `POST /admin/api/device/claim` | 轮询一个 `flow_id`；授权完成即自动建账号行 |
+| `POST /admin/api/reload` | 重载账号池，无需重启 |
+
+所有 `/admin/api/*` 都要求 `SUB2API_API_KEY`（`x-api-key` 或 `Authorization: Bearer` 均可）。不带 `--web` 时整个 router 不注册——`/admin` 返回 404，而不是"存在但被守卫"。
+
+#### 一键导入账号（只输入一个值）
+
+页面顶部的「一键导入账号」区块只有**一个输入框**，两条路径都不需要填 `session_id`、`cookies`、`email`、`max_concurrent`：
+
+| 方式 | 你要做的 | sub2api 自动做的 |
+|---|---|---|
+| **粘贴导入** | 把任意含 token 的内容粘进输入框（裸 JWT、整个 `~/.adal/adal_oauth_creds.json`、`accounts.json` 条目、甚至带 `Authorization: Bearer …` 的 curl 命令），点「粘贴导入」 | 按 JWT 形状定位 token（三段 base64url、`eyJ` 开头，且 payload 必须带 Clerk `sub`）→ 生成 `session_id` → 注册会话 → 查 email → 写库 → 重载池 |
+| **设备码登录** | 点「开始设备码登录」，在弹出的 AdaL 页面输入显示的 9 位验证码（如 `BHLE-VCXT`） | `POST /api/auth/device/initiate` → 前端每 2.5s 轮询 `claim` → 拿到 token 后同上全套 |
+
+行为细节（均为实测）：
+
+- `session_id` 由服务端生成，格式 `sub2api-pool-<12 位十六进制>`（与 `adal-registrar` 一致）；远端按 `(user, session_id)` upsert，重复无害。
+- **重复导入同一账号会更新原行，不会新增一行**：身份取 JWT 的 `sub`（Clerk user id），并保留你手动调过的 `max_concurrent`。
+- `device_code` **绝不下发到浏览器**——它等价于一个可换取 bearer 的凭据，只留在服务端内存里（`app.state.device_flows`，单 worker 前提），`expires_in` 实测 600s，过期的 flow 再 claim 返回 410。
+- 设备码的 `verification_url`（`/auth/device-verify?adal_surface=cli`）实测会 **302 到 `/sign-in`**，只提供"邮箱+密码"或 Google 登录。也就是说设备码路径要求你**这台浏览器已经登录过 AdaL**（或知道账号密码）；否则请走粘贴导入——这也是推荐路径。
+- 会话注册失败（如上游 403）时**仍然保存 token**，但行标记为 `status=unknown` / `reason=session_unregistered`，并在响应里回 `detail`——不会假装账号可用。
+- 这两条路径写出的行**没有 cookies**，因此无法通过 Clerk 重新铸造 token。这是可接受的：AdaL 边缘校验的是 Clerk 会话（JWT 的 `sid`），不是 `exp`——实测一个已过期 2 天的设备码 token 依然能跑通 `/proxy/v1/messages`、`/api/client-sessions/start` 与 `/api/credits/balance`。想要可续期的行，就粘贴带 `cookies` 的 `accounts.json` 条目，粘贴导入会一并收下。
+- 导入成功立即 `channel.refresh()`，无需再点「reload pool」；刷新失败也不会丢弃已落库的账号（响应里 `pool_reloaded: false`）。
+- 导入后的额度查询**以新账号自己的 token 认证**：`/api/user/by-clerk-id/` 对携带别人 bearer 的请求返回 403 `Cannot query other users`，因此单账号→池的切换会先清掉共享 client 上的旧 `Authorization`。这也解释了为什么行内「quota」按钮（只认 bearer）一直是对的，而 `/v1/usage` 曾显示 0。
+
+「accounts」区块里原来的手填表单收进了折叠的「手动添加 / 更新（需自备 token）」，只在你确实要指定 `session_id` 时才用得上。
+
+### 计量与成本
+
+指定 `--db`（或 `SUB2API_DB`）后，每个透传请求写一行 `usage_events`，费率按实测校准，
+`GET /v1/usage` 汇总滚动 24h。计量库在 lifespan 启动时打开——构造 app 对象（跑测试、`--help`）
+不会创建数据库文件；打不开就降级为不计量，不会拒绝服务。
+
+| 表 | 内容 |
+|---|---|
+| `usage_events` | `ts, session_id, model, provider, path, stream, status, latency_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_usd, rate_estimated` |
+| `credit_snapshots` | 额度同步快照，主键 `(session_id, ts)`：`total, monthly_allocation, monthly_used, weekly_spent, weekly_limit, weekly_remaining, is_usage_limited, limit_reason, resets_at` |
+| `accounts` | 账号池（`--web` 界面读写的就是这张表） |
+| `pool_settings` | 池级设置的 `k`/`v` 键值表（`strategy` / `max_failures` / `cooldown_seconds`） |
+
+费率（USD / 1M tokens）由**差分真实额度**测得，已含各模型促销折扣，不从目录倍率反推：
+
+| 模型 | input | output | cache write | cache read |
+|---|---|---|---|---|
+| `claude-sonnet-4-6` / `claude-sonnet-5` | 3.00 | 15.00 | 3.75 | 0.30 |
+| `claude-opus-4-6` / `claude-opus-5` | 5.00 | 25.00 | 6.25 | 0.50 |
+| `claude-fable-5-1` | 7.50 | 37.50 | 9.375 | 0.75 |
+| `gpt-5.6-terra` | 2.00 | 12.00 | 2.00 | 0.20 |
+| `gpt-5.6-luna` | 0.20 | 1.20 | 0.20 | 0.02 |
+| `gpt-5.6-sol` | 4.00 | 24.00 | 4.00 | 0.40 |
+
+两种计费惯例都实测过，按协议分别套用：
+
+- **Anthropic**：`input_tokens` **不含**缓存读和缓存写，四类 token 各按自己的费率计
+  → `in*input + out*output + cw*cache_write + cr*cache_read`
+- **OpenAI（chat / responses）**：`prompt_tokens` **含**缓存读
+  → `max(in-cr,0)*input + cr*cache_read + out*output`
+
+表中没有的模型退化为该 provider 的中档费率，并在该行标记 `rate_estimated = 1`。
+额度同步任务每 600s 拉一次各账号余额（**启动即拉一次**，这样"额度耗尽"在第一个请求前就已知，
+而不是靠烧掉一个请求发现），写入 `credit_snapshots` 并更新池内 `usage_limited`。
+
+### 命令行
+
+```bash
+python -m sub2api --help
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--host` | `SUB2API_HOST` 或 `127.0.0.1` | 监听地址 |
+| `--port` | `SUB2API_PORT` 或 `8080` | 监听端口 |
+| `--channel` | `SUB2API_CHANNEL` 或 `echo` | 激活渠道 |
+| `--web` | 关 | 挂载 `/admin` 管理界面 |
+| `--db PATH` | `SUB2API_DB` 或 `~/.adal/sub2api.sqlite3` | SQLite 路径；同时导出 `SUB2API_DB`，让计量库与账号来源始终是同一个文件 |
+
+**默认拒绝匿名启动**：没有 `SUB2API_API_KEY` 时进程直接退出（exit 2）并提示——
+一个不设 key 的网关等于把订阅额度（开了 `--web` 还包括凭证）交给任何能连上端口的人。
+确实要开放时显式设 `SUB2API_ALLOW_ANONYMOUS=1`。该检查只在启动监听时生效，构造 app 对象不受影响。
 
 
 ### CLIProxyAPI 接入详细指南
@@ -251,9 +427,6 @@ export SUB2API_CHANNEL=adal-cloud
 export SUB2API_PORT=8080
 export SUB2API_API_KEY=sk-sub2api-secret      # 对外鉴权密钥；CLIProxyAPI 侧需配同样的值
 python -m sub2api
-
-$env:SUB2API_PORT=48080;$env:SUB2API_CHANNEL="adal-cloud";$env:SUB2API_API_KEY="sk-sub2api-secret"; python -m sub2api
-
 # → Uvicorn running on http://127.0.0.1:8080
 ```
 
@@ -326,10 +499,10 @@ openai-compatibility:
   - name: "sub2api-adal"
     base-url: "http://127.0.0.1:8080/v1"      # sub2api 地址
     api-keys:
-      - "sk-sub2api-secret"                    # 与 SUB2API_API_KEY 一致；未设置则留空字符串
+      - "sk-sub2api-secret"                    # 与 SUB2API_API_KEY 一致（该值必填，sub2api 默认拒绝匿名启动）
     models:
       # name = sub2api /v1/models 返回的目录 id；alias = 对客户端暴露的名字
-      # 完整列表见 GET /v1/models；下面列出全部 33 个模型
+      # 完整列表见 GET /v1/models；下面列出全部 31 个可达模型
       - name: "anthropic-claude-sonnet-5"
         alias: "claude-sonnet-5"
       - name: "anthropic-claude-sonnet-4-6"
@@ -338,20 +511,14 @@ openai-compatibility:
         alias: "claude-opus-5"
       - name: "anthropic-claude-opus-4-6"
         alias: "claude-opus-4-6"
+      - name: "anthropic-claude-fable-5-1"
+        alias: "claude-fable-5-1"
       - name: "openai-gpt-5.6-terra"
         alias: "gpt-5.6-terra"
       - name: "openai-gpt-5.6-luna"
         alias: "gpt-5.6-luna"
       - name: "openai-gpt-5.6-sol"
         alias: "gpt-5.6-sol"
-      - name: "google-gemini-3.7-flash"
-        alias: "gemini-3.7-flash"
-      - name: "google-gemini-3.1-pro-preview"
-        alias: "gemini-3.1-pro-preview"
-      - name: "google-gemini-3.6-flash"
-        alias: "gemini-3.6-flash"
-      - name: "google-gemini-3-flash-preview"
-        alias: "gemini-3-flash-preview"
       - name: "zai-glm-5.3-flash"
         alias: "glm-5.3-flash"
       - name: "zai-glm-5.3"
@@ -386,6 +553,8 @@ openai-compatibility:
         alias: "qwen3.7-max"
       - name: "qwen-qwen3.7-plus"
         alias: "qwen3.7-plus"
+      - name: "meta-muse-spark-1.3"
+        alias: "muse-spark-1.3"
       - name: "meta-muse-spark-1.2"
         alias: "muse-spark-1.2"
       - name: "meta-muse-spark-1.1"
@@ -500,21 +669,26 @@ claude-api-key:
 
 #### 可用模型清单
 
-`GET /v1/models` 返回 33 个目录模型（`<provider>-<model>` 格式）。配置 CLIProxyAPI 时 `name` 字段填这些 id，`alias` 自定义对客户端暴露的名字：
+`GET /v1/models` 返回 31 个**已验证可达**的目录模型（`<provider>-<model>` 格式）。配置 CLIProxyAPI 时 `name` 字段填这些 id，`alias` 自定义对客户端暴露的名字。"可达路径"列是该 provider 实测 200 的接口，请求打到其他组合会得到原生 404：
 
-| Provider | 模型（sub2api id） |
-|---|---|
-| anthropic | `anthropic-claude-sonnet-5`, `anthropic-claude-sonnet-4-6`, `anthropic-claude-opus-5`, `anthropic-claude-opus-4-6` |
-| openai | `openai-gpt-5.6-terra`, `openai-gpt-5.6-luna`, `openai-gpt-5.6-sol` |
-| google | `google-gemini-3.7-flash`, `google-gemini-3.1-pro-preview`, `google-gemini-3.6-flash`, `google-gemini-3-flash-preview` |
-| zai | `zai-glm-5.3-flash`, `zai-glm-5.3`, `zai-glm-5.2`, `zai-glm-5.1` |
-| deepseek | `deepseek-deepseek-v4-flash`, `deepseek-deepseek-v4-flash-vision-exp`, `deepseek-deepseek-v4-pro` |
-| kimi | `kimi-kimi-k3`, `kimi-kimi-k2.7-code` |
-| minimax | `minimax-MiniMax-M2.7`, `minimax-MiniMax-M3` |
-| xai | `xai-grok-4.6`, `xai-grok-4.5` |
-| qwen | `qwen-qwen3.8-flash`, `qwen-qwen3.8-max`, `qwen-qwen3.7-max`, `qwen-qwen3.7-plus` |
-| meta | `meta-muse-spark-1.2`, `meta-muse-spark-1.1` |
-| chatgpt_web | `chatgpt_web-gpt-5.6-sol`, `chatgpt_web-gpt-5.6-terra`, `chatgpt_web-gpt-5.6-luna` |
+| Provider | X-Target-URL | 可达路径 | 模型（sub2api id） |
+|---|---|---|---|
+| anthropic | `api.anthropic.com` | `/v1/messages` | `anthropic-claude-sonnet-5`, `anthropic-claude-sonnet-4-6`, `anthropic-claude-opus-5`, `anthropic-claude-opus-4-6`, `anthropic-claude-fable-5-1` |
+| openai | `api.openai.com` | `/v1/chat/completions`, `/v1/responses` | `openai-gpt-5.6-terra`, `openai-gpt-5.6-luna`, `openai-gpt-5.6-sol` |
+| chatgpt_web | `api.openai.com` | `/v1/chat/completions`, `/v1/responses` | `chatgpt_web-gpt-5.6-sol`, `chatgpt_web-gpt-5.6-terra`, `chatgpt_web-gpt-5.6-luna` |
+| zai | `api.z.ai/api/anthropic` | `/v1/messages` | `zai-glm-5.3-flash`, `zai-glm-5.3`, `zai-glm-5.2`, `zai-glm-5.1` |
+| deepseek | `api.deepseek.com` | `/v1/chat/completions`, `/v1/responses` | `deepseek-deepseek-v4-flash`, `deepseek-deepseek-v4-flash-vision-exp`, `deepseek-deepseek-v4-pro` |
+| kimi | `api.moonshot.ai` | `/v1/chat/completions`, `/v1/responses` | `kimi-kimi-k3`, `kimi-kimi-k2.7-code` |
+| minimax | `api.minimax.io/anthropic` | `/v1/messages` | `minimax-MiniMax-M2.7`, `minimax-MiniMax-M3` |
+| xai | `api.x.ai` | `/v1/messages`, `/v1/chat/completions`, `/v1/responses` | `xai-grok-4.6`, `xai-grok-4.5` |
+| qwen | `dashscope-intl.aliyuncs.com/compatible-mode` | `/v1/chat/completions`, `/v1/responses` | `qwen-qwen3.8-flash`, `qwen-qwen3.8-max`, `qwen-qwen3.7-max`, `qwen-qwen3.7-plus` |
+| meta | `api.meta.ai` | `/v1/chat/completions`, `/v1/responses` | `meta-muse-spark-1.3`, `meta-muse-spark-1.2`, `meta-muse-spark-1.1` |
+
+**暂不支持**：目录里的 5 个 `google-gemini-*` 不在上表内，也不会出现在 `/v1/models`。它们的
+OpenAI 兼容层在云端代理上是死路（每种参数组合都回 403 `model_not_allowed`），只有原生
+`generativelanguage.googleapis.com` 的 `:generateContent` / `:streamGenerateContent?alt=sse` /
+`:countTokens` 可用（实测 200），接入需要一层 Anthropic/OpenAI ⇄ Gemini 协议翻译，尚未实现。
+与其列出去必然 500，不如直接不列——请求这些 model 会得到原生 404。
 
 #### 字段对照与排错
 
@@ -522,7 +696,7 @@ claude-api-key:
 |---|---|---|
 | `base-url`（openai-compatibility） | `http://127.0.0.1:8080/v1` | sub2api 地址 + `/v1` |
 | `base-url`（claude-api-key） | `http://127.0.0.1:8080` | sub2api 根地址，CLIProxyAPI 自动追加 `/v1/messages` |
-| `api-keys` / `api-key` | 与 `SUB2API_API_KEY` 一致 | sub2api 未设 `SUB2API_API_KEY` 时填空字符串 |
+| `api-keys` / `api-key` | 与 `SUB2API_API_KEY` 一致 | 必填：sub2api 默认拒绝无 key 启动（只有显式 `SUB2API_ALLOW_ANONYMOUS=1` 时才可留空） |
 | `models[].name` | sub2api `/v1/models` 里的 `id` | 必须完全匹配 |
 | `models[].alias` | 自定义 | 客户端请求时用的名字 |
 | `cloak.mode`（claude-api-key） | `"never"` | sub2api 透传不做伪装，关掉避免改写 |
@@ -531,22 +705,40 @@ claude-api-key:
 
 - **401 invalid api key**：CLIProxyAPI 的 `api-keys`/`api-key` 与 sub2api 的 `SUB2API_API_KEY` 不一致。
 - **模型不在列表**：CLIProxyAPI `models[].name` 拼写与 `/v1/models` 返回的 `id` 不符；用 `curl /v1/models` 核对。
-- **`auth_unavailable: no auth available`**：CLIProxyAPI 的 `openai-compatibility.models[]` 里**没有配客户端请求的 model**。CLIProxyAPI 按客户端发的 `model` 匹配 `models[].name` 或 `alias`，匹配不到就报此错。解决：把所有要用的模型都加到 `models[]`（见上方完整 33 个模型配置），或确保客户端请求的 model 名与 `alias` 一致。
+- **`auth_unavailable: no auth available`**：CLIProxyAPI 的 `openai-compatibility.models[]` 里**没有配客户端请求的 model**。CLIProxyAPI 按客户端发的 `model` 匹配 `models[].name` 或 `alias`，匹配不到就报此错。解决：把所有要用的模型都加到 `models[]`（见上方完整 31 个模型配置），或确保客户端请求的 model 名与 `alias` 一致。
 - **`/v1/messages` 走了 OpenAI 上游**：`claude-api-key` 的 `base-url` 不要带 `/v1`，CLIProxyAPI 自己追加 `/v1/messages`。
 - **404 `{"detail":"Not Found"}`**：`base-url` 多带了 `/v1` 导致路径变成 `/v1/v1/messages`。`claude-api-key` 填根地址 `http://127.0.0.1:8080`（不带 `/v1`）。若无法改 CLIProxyAPI 配置，sub2api 也兼容 `/v1/v1/messages` 和 `/v1/v1/chat/completions` 别名。
-- **400 `max_tokens` not supported**：OpenAI 新模型（gpt-5.6-*）只认 `max_completion_tokens`。sub2api 已自动把 `max_tokens` 重写为 `max_completion_tokens`（仅 OpenAI 模型），CLIProxyAPI 侧无需改动。
+- **400 `max_tokens` not supported**：OpenAI 新模型（gpt-5.6-*）只认 `max_completion_tokens`，Responses API 只认 `max_output_tokens`。sub2api 已自动按协议改写，CLIProxyAPI 侧无需改动。
+- **Claude Code 一次成功后连续 500**：这是未经净化直连云端代理的症状（`context_management` 等字段触发 `unexpected keyword argument`）。sub2api 的兼容层已处理，若仍出现请确认请求确实经过 sub2api 而非直连 `api.adal.sylph.ai`。
+- **非流式 `/v1/messages` 在大 `max_tokens` 下 500**：上游对 `max_tokens > 21333` 的非流式请求硬 500。sub2api 改走"上游流式 + 服务端聚合"，客户端无需改动。
+- **某个 model 返回 404 `model not found`**：该 provider 不在这条路径上提供服务（如 `zai` 只有 `/v1/messages`），或请求的是 `google-*`。用 `curl /v1/models` 核对可达清单。
 - **流式中断**：确认 sub2api 进程存活（`curl /healthz`），且 CLIProxyAPI 与 sub2api 同机或网络可达。
 
 ### API
 
-| 端点 | 说明 |
-|---|---|
-| `POST /v1/chat` | 同步对话，返回 `{answer, session_id, channel, model}` |
-| `POST /v1/chat/stream` | SSE 流式，逐帧输出归一化事件 |
-| `GET /v1/channels` | 已注册渠道列表 + 当前渠道健康状态 |
-| `GET /v1/sessions/{id}` | 会话详情（轮数、native id、模型） |
-| `GET /v1/usage` | 订阅额度（`adal-cloud`）：`isValid`/`planName`/`used`/`total`/`remaining`/`unit`，`?refresh=1` 绕过缓存 |
-| `GET /healthz` | 存活探针 |
+| 端点 | 鉴权 | 说明 |
+|---|---|---|
+| `POST /v1/messages` | ✔ | Anthropic Messages（`adal-cloud` 透传） |
+| `POST /v1/messages/count_tokens` | ✔ | Anthropic Token Counting，回 `{"input_tokens": N}` |
+| `POST /v1/chat/completions` | ✔ | OpenAI Chat Completions |
+| `POST /v1/responses` | ✔ | OpenAI Responses API |
+| `GET` / `DELETE /v1/responses/{id}` | ✔ | 获取/删除已创建的 response 对象 |
+| `GET /v1/models` | ✔ | 可达模型列表（OpenAI 格式） |
+| `POST /v1/chat` | ✔ | 归一化同步对话，返回 `{answer, session_id, channel, model}` |
+| `POST /v1/chat/stream` | ✔ | 归一化 SSE 流式，逐帧输出事件 |
+| `GET /v1/channels` | ✔ | 已注册渠道列表 + 当前渠道健康状态 |
+| `GET /v1/sessions/{id}` | ✔ | 会话详情（轮数、native id、模型） |
+| `GET /v1/usage` | ✔ | 订阅额度 + 本地 24h 计量，`?refresh=1` 绕过缓存 |
+| `GET /v1/health` | ✔ | 渠道详情：账号池内部、prompt cache、token 存在性 |
+| `GET /healthz` | ✘ | 存活探针，只回 `{"status","version"}` |
+| `/admin`, `/admin/api/*` | 页面✘ / API✔ | 管理界面（仅 `--web`，见「管理界面」） |
+
+鉴权接受两种写法（真实客户端两派都有）：Anthropic SDK 与 Claude Code 发 `x-api-key`，
+OpenAI 兼容客户端发 `Authorization: Bearer`。比较用常量时间，避免 `!=` 通过时序泄露前缀。
+
+兼容别名（给 base-url 里多带了 `/v1` 或省掉 `/v1` 的客户端）：
+`/v1/v1/messages`、`/v1/v1/chat/completions`、`/v1/v1/responses`、`/v1/v1/usage`、
+`/v1/completions`、`/models`、`/usage`。
 
 请求体：
 
@@ -569,11 +761,15 @@ SSE 帧类型：`session.started` → `thought.delta` / `text.delta` / `message.
 |---|---|---|
 | `SUB2API_CHANNEL` | `echo` | 激活的渠道名 |
 | `SUB2API_HOST` / `SUB2API_PORT` | `127.0.0.1` / `8080` | 监听地址 |
-| `SUB2API_WORKSPACE` | `.` | 渠道默认工作目录 |
-| `SUB2API_ACCOUNTS` | — | JSON，多账号池配置（详见「多账号池」章节）；也可用 `~/.adal/accounts.json` |
+| `SUB2API_API_KEY` | — | 全部 `/v1/*`、`/admin/api/*` 要求 `x-api-key` 或 `Authorization: Bearer`（`/healthz` 与 `/admin` 页面除外）。**未设置时进程拒绝启动** |
+| `SUB2API_ALLOW_ANONYMOUS` | — | 设为 `1` 才允许无 key 启动（明确放弃鉴权） |
+| `SUB2API_WEB` | — | 设为 `1` 挂载 `/admin` 管理界面，等价于 `--web` |
+| `SUB2API_DB` | `~/.adal/sub2api.sqlite3` | SQLite 路径：计量库 + 账号库，等价于 `--db` |
+| `SUB2API_PROXY` | — | 出网 HTTP(S) 代理，作用于所有对上游的 `httpx` 连接 |
+| `SUB2API_ACCOUNTS` | — | JSON，多账号池配置（详见「多账号池」章节）；也可用 SQLite 或 `~/.adal/accounts.json` |
 | `SUB2API_AUTH_TOKEN` | — | 显式 JWT（如 AdaL 的 `access_token`），CI 无浏览器时用 |
-| `SUB2API_API_KEY` | — | 设置后 `/v1/*` 全部要求 `Authorization: Bearer <key>`（`/healthz` 除外） |
-| `SUB2API_OPENAI_PERMISSION_MODE` | `yolo` | OpenAI 兼容路由使用的权限模式 |
+| `SUB2API_WORKSPACE` | `.` | 渠道默认工作目录 |
+| `SUB2API_OPENAI_PERMISSION_MODE` | `yolo` | OpenAI 兼容路由（归一化路径）使用的权限模式 |
 | `SUB2API_ENABLED_TOOLS` | — | 部署级工具白名单（逗号分隔），请求未显式指定时生效 |
 | `SUB2API_RUNTIME_PATH` | — | 渠道运行时路径（如 adal 可执行文件） |
 | `SUB2API_CHANNEL_OPTIONS` | — | JSON，透传给渠道的额外选项 |
@@ -618,7 +814,7 @@ class MyChannel(BaseChannel):
 ## 测试
 
 ```bash
-pytest -q          # 65 个用例：契约、注册表、会话、聚合、两个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层
+pytest -q          # 448 个用例：契约、注册表、会话、聚合、兼容层净化/聚合/错误还原、路由表、费率、计量库、账号池、四个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层、管理界面（含一键导入/设备码流）、CLI
 ```
 
 无需安装 AdaL 即可跑全部测试——AdaL 渠道用假运行时（临时启动器脚本）做子进程级验证，SDK 渠道测纯映射函数。

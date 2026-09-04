@@ -24,6 +24,8 @@ class ChannelConfig:
     workspace: str = "."
     auth_token: str | None = None
     runtime_path: str | None = None
+    proxy: str | None = None
+    """Outbound HTTP(S) proxy for upstream calls (``SUB2API_PROXY``)."""
     options: dict[str, Any] = field(default_factory=dict)
 
 
