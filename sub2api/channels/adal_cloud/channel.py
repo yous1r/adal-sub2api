@@ -609,12 +609,20 @@ class AdalCloudChannel(BaseChannel):
 
     # -- usage / quota -----------------------------------------------------
 
-    def _quota_accounts(self) -> list[tuple[str, str]]:
-        """``(token, dead_reason)`` for every account backing this channel."""
+    def _quota_accounts(self) -> list[tuple[str, str, str]]:
+        """``(token, dead_reason, session_id)`` for every channel account.
+
+        ``session_id`` is the pool's account identity and the join key the
+        admin UI needs to pair a subscription-quota row with locally metered
+        spend; single-account mode falls back to the registered session id.
+        """
         if self._pool is not None:
-            return [(slot.token, slot.dead_reason) for slot in self._pool.slots]
+            return [
+                (slot.token, slot.dead_reason, slot.session_id)
+                for slot in self._pool.slots
+            ]
         if self._token:
-            return [(self._token, "")]
+            return [(self._token, "", self._proxy_sid or "single")]
         return []
 
     async def _tiers(self, client: httpx.AsyncClient) -> dict[str, Any]:
@@ -630,15 +638,17 @@ class AdalCloudChannel(BaseChannel):
         accounts = self._quota_accounts()
         gate = asyncio.Semaphore(USAGE_FETCH_CONCURRENCY)
 
-        async def one(token: str, dead_reason: str) -> dict[str, Any]:
+        async def one(token: str, dead_reason: str, session_id: str) -> dict[str, Any]:
             async with gate:
                 row = await _pkg.fetch_account_quota(client, token)
             if dead_reason:
                 row["dead_reason"] = dead_reason
+            row["session_id"] = session_id
             return row
 
         tiers, *rows = await asyncio.gather(
-            self._tiers(client), *(one(t, d) for t, d in accounts)
+            self._tiers(client),
+            *(one(t, d, sid) for t, d, sid in accounts),
         )
         return _pkg.aggregate_quota(
             rows,

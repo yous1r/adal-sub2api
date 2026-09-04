@@ -230,20 +230,42 @@ async def test_usage_totals_sums_and_respects_since(db: Store):
 
 
 @pytest.mark.anyio
-async def test_record_usage_defaults_missing_keys(db: Store):
-    await db.record_usage(model="m", provider="p", path="/v1/messages")
-    totals = await db.usage_totals(since=0)
-    assert totals["requests"] == 1
-    assert totals["tokens"]["input"] == 0
+async def test_usage_by_session_bills_each_account_separately(db: Store):
+    base = time.time() - 100
+    for sid, cost, n in (("sess_a", 0.0100, 3), ("sess_b", 0.0002, 1)):
+        for i in range(n):
+            await db.record_usage(
+                ts=base + i,
+                session_id=sid,
+                model="m",
+                provider="p",
+                path="/v1/messages",
+                input_tokens=10,
+                output_tokens=1,
+                cost_usd=cost / n,
+            )
+    # A row with no session (single-account mode before pooling) is not an
+    # account and must not create a bogus entry.
+    await db.record_usage(
+        ts=base, model="m", provider="p", path="/v1/messages", cost_usd=9.9
+    )
+
+    by_session = await db.usage_by_session(since=0)
+    assert set(by_session) == {"sess_a", "sess_b"}
+    assert by_session["sess_a"]["requests"] == 3
+    assert by_session["sess_a"]["cost_usd"] == pytest.approx(0.0100)
+    assert by_session["sess_b"]["requests"] == 1
+    assert by_session["sess_b"]["input_tokens"] == 10
+    # Ordered by spend, most expensive first.
+    assert list(by_session) == ["sess_a", "sess_b"]
+
+    later = await db.usage_by_session(since=base + 1000)
+    assert later == {}
 
 
 @pytest.mark.anyio
-async def test_record_usage_ignores_unknown_keys(db: Store):
-    await db.record_usage(
-        model="m", provider="p", path="/p", totally_unknown_key="x", another=42
-    )
-    totals = await db.usage_totals(since=0)
-    assert totals["requests"] == 1
+async def test_usage_by_session_empty_without_traffic(db: Store):
+    assert await db.usage_by_session(since=0) == {}
 
 
 # -- credit snapshots ---------------------------------------------------------

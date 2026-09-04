@@ -420,6 +420,46 @@ class Store:
 
         return await asyncio.to_thread(run)
 
+    async def usage_by_session(self, since: float) -> dict[str, dict]:
+        """Per-account local metering totals for the trailing window.
+
+        Keyed by ``session_id`` — the pool's account identity — so the admin
+        UI can bill each account for what it actually consumed, next to its
+        subscription quota.  Accounts with no traffic in the window are
+        simply absent; an empty dict means nothing was metered.
+        """
+
+        def run() -> dict[str, dict]:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT session_id,
+                           COUNT(*) AS requests,
+                           COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                           COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                           COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+                           COALESCE(SUM(reasoning_tokens), 0) AS reasoning,
+                           COALESCE(SUM(cost_usd), 0.0) AS cost_usd
+                    FROM usage_events WHERE ts >= ?
+                    GROUP BY session_id ORDER BY cost_usd DESC
+                    """,
+                    (since,),
+                ).fetchall()
+            return {
+                r["session_id"]: {
+                    "requests": int(r["requests"]),
+                    "input_tokens": int(r["input_tokens"]),
+                    "output_tokens": int(r["output_tokens"]),
+                    "cache_read_tokens": int(r["cache_read"]),
+                    "reasoning_tokens": int(r["reasoning"]),
+                    "cost_usd": round(float(r["cost_usd"]), 6),
+                }
+                for r in rows
+                if r["session_id"]
+            }
+
+        return await asyncio.to_thread(run)
+
     # -- credits -------------------------------------------------------------
 
     async def record_credits(self, session_id: str, **fields: Any) -> None:

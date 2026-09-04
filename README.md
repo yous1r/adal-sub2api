@@ -206,8 +206,12 @@ curl http://127.0.0.1:8080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
     "queried_at": "2026-09-04T14:32:11Z",
     "requests": 17, "tokens": 21384, "cost_usd": 0.235578,
     "window": "24h", "rate_source": "calibrated",
+    "by_session": {
+      "sub2api-3bbc192f3966": {"requests": 17, "input_tokens": 18320, "output_tokens": 3064, "cost_usd": 0.235578}
+    },
     "detail": [{
       "ok": true, "email": "…", "tier": "pro", "status": "trialing",
+      "session_id": "sub2api-3bbc192f3966",
       "limit_basis": "weekly-trial",
       "total": 20.0, "used": 19.828592, "remaining": 0.171408,
       "monthly_total": 80.0, "monthly_used": 19.828592,
@@ -228,6 +232,7 @@ curl http://127.0.0.1:8080/v1/usage -H "Authorization: Bearer sk-sub2api-secret"
 - 聚合结果缓存 30s、套餐目录缓存 600s，账号查询并发上限 8——定时轮询不会放大成上游请求风暴。`?refresh=1` 强制绕过缓存。
 - 额度查询**永不抛错**：上游异常降级为 `isValid: false` + `invalidMessage`，不会让端点 500。
 - `sub2api.requests` / `tokens` / `cost_usd` 是**本地计量**的滚动 24h 汇总（见「计量与成本」）。未开启计量库时这几个键**不出现**，避免把"没测量"显示成"花了 0"。
+- **每个账号单独计费**：开启计量库时，payload 额外携带 `sub2api.by_session`——按 `session_id` 分组的滚动 24h 计量（`requests` / `input_tokens` / `output_tokens` / `cache_read_tokens` / `reasoning_tokens` / `cost_usd`，按花费降序）。`sub2api.detail[]` 每行也带 `session_id`（单账号模式为占位 `"single"`），两份数据一 join，`--web` 管理页就能给**每个账号**渲染一张"额度 + 该账号自己花了多少"的卡片。
 - 合并写在 payload 的副本上：渠道会缓存云端额度 30s，原地改会把逐请求明细累积进缓存。
 - 别名：`GET /usage`、`GET /v1/v1/usage`；受 `SUB2API_API_KEY` 保护（未带 key 返回 401）。非 `adal-cloud` 渠道返回 501 `channel_not_supported`。
 
@@ -321,7 +326,7 @@ sub2api 自动为透传请求注入 **prompt cache** 标记，利用上游提供
 
 ### 管理界面（`--web`）
 
-`--web`（或 `SUB2API_WEB=1`）在**同一端口**挂载 `/admin` 管理界面——单页 HTML，无外部依赖、无构建步骤。
+`--web`（或 `SUB2API_WEB=1`）在**同一端口**挂载 `/admin` 管理界面——单页 HTML，无外部依赖、无构建步骤。界面按账号池视角组织：**订阅额度**（总额度 / 总剩余 / 已使用 / 套餐，试用账号按周限额计）→ **本地计量**（滚动 24h 的请求数、成本、输入输出 tokens）→ **账号池**（每个账号一张卡片：可花额度、计费依据、周/月进度条、该账号自己的 24h 计费）→ **添加账号**（粘贴导入 / 设备码登录 / 文件导入导出）。深色玻璃拟态风格，青绿主色调。
 
 ```bash
 SUB2API_API_KEY=sk-sub2api-secret python -m sub2api \
@@ -787,7 +792,7 @@ class MyChannel(BaseChannel):
 ## 测试
 
 ```bash
-pytest -q          # 464 个用例：契约、注册表、会话、聚合、兼容层净化/聚合/错误还原、路由表（含原生 id 暴露）、费率、计量库、账号池、四个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层、订阅额度（含试用周限额）、管理界面（含一键导入/设备码流）、CLI
+pytest -q          # 466 个用例：契约、注册表、会话、聚合、兼容层净化/聚合/错误还原、路由表（含原生 id 暴露）、费率、计量库（含按账号分组计费）、账号池、四个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层、订阅额度（含试用周限额、按账号计费 payload）、管理界面（含一键导入/设备码流）、CLI
 ```
 
 无需安装 AdaL 即可跑全部测试——AdaL 渠道用假运行时（临时启动器脚本）做子进程级验证，SDK 渠道测纯映射函数。

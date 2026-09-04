@@ -37,113 +37,190 @@ from ...core.pool import DEFAULT_MAX_CONCURRENT
 from ..auth import unauthorized
 
 _PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>sub2api admin</title>
+<title>sub2api 控制台</title>
 <style>
-:root{color-scheme:dark;--bg:#0f1115;--panel:#171a21;--line:#272c37;--fg:#e6e8ee;
---mut:#8b93a7;--acc:#6ea8fe;--bad:#f0616d;--ok:#4ec9a0}
+:root{color-scheme:dark;
+  --bg:#020617;--panel:rgba(30,41,59,.5);--panel-solid:#1e293b;
+  --line:rgba(51,65,85,.5);--fg:#f1f5f9;--mut:#94a3b8;--dim:#64748b;
+  --acc:#14b8a6;--acc2:#2dd4bf;--acc-deep:#0d9488;
+  --bad:#ef4444;--ok:#10b981;--warn:#f59e0b;--info:#8b5cf6}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
-header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;
-gap:16px;align-items:baseline;flex-wrap:wrap}
-h1{font-size:16px;margin:0;letter-spacing:.04em}
-.mut{color:var(--mut)}
-main{padding:20px;display:grid;gap:20px;max-width:1200px}
-section{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-padding:16px}
-h2{font-size:13px;margin:0 0 12px;text-transform:uppercase;letter-spacing:.08em;
-color:var(--mut)}
+html{scroll-behavior:smooth}
+body{margin:0;min-height:100vh;background:
+  radial-gradient(at 40% 20%,rgba(20,184,166,.12) 0,transparent 50%),
+  radial-gradient(at 80% 0%,rgba(6,182,212,.08) 0,transparent 50%),
+  radial-gradient(at 0% 50%,rgba(20,184,166,.08) 0,transparent 50%),
+  var(--bg);
+  color:var(--fg);font:14px/1.5 system-ui,-apple-system,"Segoe UI","PingFang SC",
+  "Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+::selection{background:rgba(20,184,166,.2)}
+::-webkit-scrollbar{height:6px;width:6px}::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{border-radius:9999px;background:transparent}
+*:hover::-webkit-scrollbar-thumb{background:rgba(71,85,105,.5)}
+header{position:sticky;top:0;z-index:10;backdrop-filter:blur(20px);
+  background:rgba(2,6,23,.8);border-bottom:1px solid var(--line)}
+.hwrap{max-width:1200px;margin:0 auto;padding:14px 24px;display:flex;
+  gap:14px;align-items:center;flex-wrap:wrap}
+.logo{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;
+  justify-content:center;background:linear-gradient(135deg,var(--acc) 0,var(--acc-deep) 100%);
+  color:#fff;font-weight:700;font-size:15px;box-shadow:0 4px 16px rgba(20,184,166,.3)}
+h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.02em}
+.mut{color:var(--mut)}.dim{color:var(--dim)}
+.pill{border:1px solid var(--line);border-radius:9999px;padding:2px 10px;
+  font-size:11px;background:rgba(30,41,59,.5)}
+.pill.live{color:var(--ok);border-color:rgba(16,185,129,.4)}
+.spacer{flex:1}
+#key{width:220px}
+main{max-width:1200px;margin:0 auto;padding:24px;display:grid;gap:20px}
+.card{background:var(--panel);backdrop-filter:blur(12px);border:1px solid var(--line);
+  border-radius:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.card-h{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
+  align-items:center;gap:10px;flex-wrap:wrap}
+.card-h h2{font-size:13px;font-weight:600;margin:0;letter-spacing:.02em}
+.card-b{padding:20px}
+.ic{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;
+  justify-content:center;font-size:17px;flex-shrink:0}
+.ic.teal{background:rgba(20,184,166,.15);color:var(--acc2)}
+.ic.green{background:rgba(16,185,129,.15);color:var(--ok)}
+.ic.amber{background:rgba(245,158,11,.15);color:var(--warn)}
+.ic.violet{background:rgba(139,92,246,.15);color:var(--info)}
+.ic.red{background:rgba(239,68,68,.15);color:var(--bad)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
+.stat{display:flex;gap:12px;align-items:flex-start;background:var(--panel);
+  border:1px solid var(--line);border-radius:16px;padding:16px;
+  box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.stat .lb{font-size:12px;color:var(--mut)}
+.stat .v{font-size:22px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}
+.stat .sub{font-size:11px;color:var(--dim);margin-top:2px}
+.big{font-size:26px}
+.bar{height:6px;border-radius:9999px;background:rgba(51,65,85,.6);overflow:hidden;
+  margin-top:8px}
+.bar i{display:block;height:100%;border-radius:9999px;
+  background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .4s ease}
+.bar.hot i{background:linear-gradient(90deg,#f59e0b,#ef4444)}
+.bar.maxed i{background:var(--bad)}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);
-vertical-align:middle}
-th{color:var(--mut);font-weight:500}
-input{background:#0c0e12;color:var(--fg);border:1px solid var(--line);
-border-radius:4px;padding:5px 7px;font:inherit;width:100%}
-button{background:#222735;color:var(--fg);border:1px solid var(--line);
-border-radius:4px;padding:5px 11px;font:inherit;cursor:pointer}
-button:hover{border-color:var(--acc)}
-button.bad:hover{border-color:var(--bad);color:var(--bad)}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--mut);font-weight:500;font-size:12px;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td.num{font-variant-numeric:tabular-nums}
+input{background:rgba(2,6,23,.6);color:var(--fg);border:1px solid var(--line);
+  border-radius:10px;padding:7px 11px;font:inherit;transition:border-color .2s}
+input:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px rgba(20,184,166,.25)}
+input::placeholder{color:var(--dim)}
+button{background:rgba(30,41,59,.8);color:var(--fg);border:1px solid var(--line);
+  border-radius:10px;padding:7px 14px;font:inherit;font-size:13px;font-weight:500;
+  cursor:pointer;transition:all .15s}
+button:hover{border-color:var(--acc);color:var(--acc2)}
+button:active{transform:scale(.98)}
+button.primary{background:linear-gradient(135deg,var(--acc),var(--acc-deep));
+  border-color:transparent;color:#fff;box-shadow:0 4px 14px rgba(20,184,166,.3)}
+button.primary:hover{filter:brightness(1.1);color:#fff}
+button.danger:hover{border-color:var(--bad);color:var(--bad)}
+button.sm{padding:4px 10px;font-size:12px;border-radius:8px}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-.stat{border:1px solid var(--line);border-radius:6px;padding:10px 12px}
-.stat b{display:block;font-size:18px;font-weight:600}
-.tag{border:1px solid var(--line);border-radius:10px;padding:1px 8px;font-size:11px}
-.limited{color:var(--bad);border-color:var(--bad)}
-.live{color:var(--ok);border-color:var(--ok)}
-#log{white-space:pre-wrap;color:var(--mut);font-size:12px;min-height:18px}
-summary{cursor:pointer;font-size:12px}
-a{color:var(--acc)}
+.tag{border:1px solid var(--line);border-radius:9999px;padding:1px 9px;
+  font-size:11px;display:inline-block}
+.tag.alive{color:var(--ok);border-color:rgba(16,185,129,.4);background:rgba(16,185,129,.1)}
+.tag.unknown{color:var(--warn);border-color:rgba(245,158,11,.4);background:rgba(245,158,11,.1)}
+.tag.dead{color:var(--bad);border-color:rgba(239,68,68,.4);background:rgba(239,68,68,.1)}
+.tag.limited{color:var(--bad);border-color:rgba(239,68,68,.4)}
+.qgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.qcard{background:rgba(2,6,23,.4);border:1px solid var(--line);border-radius:14px;padding:14px}
+.qcard .top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.qcard .email{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.qcard .nums{font-size:12px;color:var(--mut);margin-top:2px;font-variant-numeric:tabular-nums}
+.qcard .nums b{color:var(--fg);font-size:14px}
+.spent{color:var(--acc2)}.cost{color:var(--warn)}
+#log{white-space:pre-wrap;color:var(--mut);font-size:12px;min-height:18px;
+  font-family:ui-monospace,Consolas,monospace;max-height:130px;overflow:auto}
+summary{cursor:pointer;font-size:12px;color:var(--mut)}
+summary:hover{color:var(--acc2)}
+a{color:var(--acc2);text-decoration:none}
+a:hover{text-decoration:underline}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body>
-<header>
-  <h1>sub2api admin</h1>
-  <span class="mut" id="ver"></span>
-  <span class="row" style="margin-left:auto">
-    <input id="key" type="password" placeholder="API key" style="width:230px">
-    <button onclick="saveKey()">use key</button>
-    <button onclick="loadAll()">refresh</button>
-  </span>
-</header>
+<header><div class="hwrap">
+  <div class="logo">S2</div>
+  <h1>sub2api 控制台</h1>
+  <span class="pill mut" id="ver"></span>
+  <span class="spacer"></span>
+  <input id="key" type="password" placeholder="API key">
+  <button class="primary" onclick="saveKey()">连接</button>
+  <button onclick="loadAll()">刷新</button>
+</div></header>
 <main>
-<section>
-  <h2>usage &mdash; last 24h</h2>
-  <div class="grid" id="totals"></div>
+<section class="card">
+  <div class="card-h"><h2>订阅额度</h2><span class="dim" style="font-size:12px">
+    试用账号按周限额计，付费账号按月度额度</span>
+    <span class="spacer"></span><span class="pill mut" id="pool_note"></span></div>
+  <div class="card-b"><div class="stats" id="quota_stats"></div></div>
 </section>
-<section>
-  <h2>&#19968;&#38190;&#23548;&#20837;&#36134;&#21495;</h2>
-  <div class="row">
-    <input id="p_text" placeholder="&#31896;&#36148; token / adal_oauth_creds.json &#20869;&#23481;" style="flex:1;min-width:280px">
-    <button onclick="pasteImport()">&#31896;&#36148;&#23548;&#20837;</button>
-  </div>
-  <div class="row mut" style="margin-top:6px;font-size:12px">
-    &#31896;&#36148;&#20219;&#24847;&#21547; token &#30340;&#20869;&#23481;&#65288;JWT&#12289;adal_oauth_creds.json&#12289;accounts.json &#26465;&#30446;&#65289;&#65292;session_id &#33258;&#21160;&#29983;&#25104;
-  </div>
-  <div class="row" style="margin-top:14px">
-    <button id="dev_btn" onclick="deviceStart()">&#24320;&#22987;&#35774;&#22791;&#30721;&#30331;&#24405;</button>
-    <span class="mut">&#25110;&#32773;&#23436;&#20840;&#19981;&#38656;&#35201; token&#65306;&#28857;&#20987;&#21518;&#22312; AdaL &#39029;&#38754;&#36755;&#20837;&#39564;&#35777;&#30721;&#65292;&#36134;&#21495;&#33258;&#21160;&#20837;&#27744;</span>
-  </div>
-  <div class="row" id="dev_box" style="display:none;margin-top:12px">
-    <a id="dev_url" target="_blank" rel="noopener">&#25171;&#24320;&#25480;&#26435;&#39029;&#38754;</a>
-    <b id="dev_code" style="font-size:20px;letter-spacing:.16em"></b>
-    <button onclick="devCopy()">&#22797;&#21046;&#39564;&#35777;&#30721;</button>
-    <span class="mut" id="dev_state"></span>
-  </div>
+<section class="card">
+  <div class="card-h"><h2>本地计量 — 近 24 小时</h2>
+    <span class="dim" style="font-size:12px">按账号单独立账，费率经实测校准</span></div>
+  <div class="card-b"><div class="stats" id="local_stats"></div></div>
 </section>
-<section>
-  <h2>accounts</h2>
-  <table><thead><tr>
-    <th>session_id</th><th>email</th><th>token</th><th>cookies</th>
-    <th style="width:90px">max</th><th>status</th><th style="width:210px"></th>
+<section class="card">
+  <div class="card-h"><h2>账号池</h2><span class="pill mut" id="acc_count"></span>
+    <span class="spacer"></span>
+    <button class="sm" onclick="doReload()">重载连接池</button></div>
+  <div class="card-b"><div class="qgrid" id="quota_cards"></div>
+  <table style="margin-top:14px"><thead><tr>
+    <th>邮箱</th><th>session_id</th><th>token</th><th>cookies</th>
+    <th style="width:84px">并发上限</th><th>状态</th><th>24h 计费</th><th style="width:200px"></th>
   </tr></thead><tbody id="rows"></tbody></table>
-  <details style="margin-top:12px">
-  <summary class="mut">&#25163;&#21160;&#28155;&#21152; / &#26356;&#26032;&#65288;&#38656;&#33258;&#22791; token&#65289;</summary>
-  <div class="row" style="margin-top:10px">
+  <details style="margin-top:14px">
+  <summary>手动添加 / 更新（需自备 token）</summary>
+  <div class="row" style="margin-top:12px">
     <input id="n_sid" placeholder="session_id" style="width:190px">
-    <input id="n_tok" placeholder="token (JWT)" style="width:230px">
-    <input id="n_mail" placeholder="email" style="width:160px">
-    <input id="n_max" placeholder="max" value="4" style="width:70px">
-    <button onclick="addAccount()">add / update</button>
+    <input id="n_tok" placeholder="token (JWT)" style="width:250px">
+    <input id="n_mail" placeholder="邮箱" style="width:170px">
+    <input id="n_max" placeholder="并发" value="4" style="width:70px">
+    <button onclick="addAccount()">保存</button>
   </div>
-  </details>
+  </details></div>
 </section>
-<section>
-  <h2>import / export</h2>
-  <div class="row">
-    <input id="file" type="file" accept="application/json" style="width:290px">
-    <button onclick="doImport()">import accounts.json</button>
-    <button onclick="doExport()">download export</button>
-    <button onclick="doReload()">reload pool</button>
+<section class="card">
+  <div class="card-h"><h2>添加账号</h2></div>
+  <div class="card-b">
+    <div class="row">
+      <input id="p_text" placeholder="粘贴含 token 的内容（JWT、adal_oauth_creds.json、accounts.json 条目）"
+        style="flex:1;min-width:280px">
+      <button class="primary" onclick="pasteImport()">粘贴导入</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="dev_btn" onclick="deviceStart()">设备码登录</button>
+      <span class="dim" style="font-size:12px">无需 token：点击后在 AdaL 页面输入验证码，账号自动入池</span>
+    </div>
+    <div class="row" id="dev_box" style="display:none;margin-top:12px;padding:12px;
+      border:1px dashed var(--line);border-radius:12px">
+      <a id="dev_url" target="_blank" rel="noopener">打开授权页面</a>
+      <b id="dev_code" style="font-size:20px;letter-spacing:.16em;color:var(--acc2)"></b>
+      <button class="sm" onclick="devCopy()">复制验证码</button>
+      <span class="mut" id="dev_state" style="font-size:12px"></span>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <input id="file" type="file" accept="application/json" style="width:290px">
+      <button onclick="doImport()">导入 accounts.json</button>
+      <button onclick="doExport()">下载导出</button>
+    </div>
   </div>
 </section>
-<section><h2>log</h2><div id="log"></div></section>
+<section class="card"><div class="card-h"><h2>日志</h2></div>
+  <div class="card-b"><div id="log"></div></div></section>
 </main>
 <script>
 let KEY = sessionStorage.getItem("s2a_key") || "";
 document.getElementById("key").value = KEY;
 function saveKey(){KEY=document.getElementById("key").value.trim();
   sessionStorage.setItem("s2a_key",KEY);loadAll();}
-function log(m){document.getElementById("log").textContent=m;}
+function log(m){const el=document.getElementById("log");
+  el.textContent=m+"\\n"+el.textContent.split("\\n").slice(0,4).join("\\n");}
 function hdr(extra){const h=extra||{};if(KEY)h["x-api-key"]=KEY;return h;}
 async function api(path,opts){
   const o=opts||{};o.headers=hdr(o.headers);
@@ -155,59 +232,131 @@ async function api(path,opts){
 }
 function esc(v){return String(v==null?"":v).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]));}
+function usd(v){return "$"+(Math.round(v*1e4)/1e4);}
+function stat(icon,cls,label,value,sub,bar){
+  return '<div class="stat"><div class="ic '+cls+'">'+icon+'</div><div style="min-width:0;flex:1">'
+    +'<div class="lb">'+esc(label)+'</div><div class="v">'+esc(value)+'</div>'
+    +(sub?'<div class="sub">'+sub+'</div>':"")
+    +(bar?'<div class="bar '+bar.cls+'"><i style="width:'+Math.min(100,bar.pct)+'%"></i></div>':"")
+    +"</div></div>";
+}
+function quotaCard(r){
+  const spendable=r.total||0,remaining=r.remaining||0,used=r.used||0;
+  const pct=spendable>0?(used/spendable*100):0;
+  const cls=pct>=100?"maxed":(pct>=90?"hot":"");
+  const basis=r.limit_basis==="weekly-trial"?"周限额":"月度额度";
+  const monthly=(r.monthly_total!=null)
+    ?'<div class="sub">月度额度 '+usd(r.monthly_total)
+      +" · 剩 "+usd(r.monthly_remaining||0)+"</div>":"";
+  const cost=(r.cost_usd!=null)
+    ?'<div class="sub">24h 计费 <b class="cost">'+usd(r.cost_usd)+"</b> · "
+      +esc(r.requests||0)+" 次请求</div>":"";
+  const reset=r.period_end?'<div class="sub">'+esc(r.period_end)+" 重置</div>":"";
+  return '<div class="qcard"><div class="top">'
+    +'<span class="email" title="'+esc(r.email||"")+'">'+esc(r.email||"(未知邮箱)")+"</span>"
+    +'<span class="tag '+(cls==="maxed"?"dead":(cls==="hot"?"unknown":"alive"))+'">'
+    +esc(basis)+"</span></div>"
+    +'<div class="nums">剩 <b class="spent">'+usd(remaining)+"</b> / "+usd(spendable)
+    +"&nbsp;·&nbsp;已用 "+usd(used)+"</div>"
+    +'<div class="bar '+cls+'"><i style="width:'+Math.min(100,pct)+'%"></i></div>'
+    +monthly+cost+reset+"</div>";
+}
 async function loadAll(){
   try{
     const h=await api("/v1/health");
-    document.getElementById("ver").textContent="v"+h.version+" \\u00b7 "+h.channel.channel;
+    document.getElementById("ver").textContent="v"+h.version+" · "+h.channel.channel;
   }catch(e){log(String(e.message));}
+  await Promise.all([loadQuota(),loadLocal(),loadAccounts()]);
+}
+async function loadQuota(){
   try{
     const u=await api("/v1/usage");
-    const d=u.sub2api||{};const t=d.tokens||{};
-    document.getElementById("totals").innerHTML=[
-      ["requests",d.requests==null?"\\u2014":d.requests],
-      ["local cost",d.cost_usd==null?"\\u2014":"$"+d.cost_usd],
-      ["in tokens",t.input==null?"\\u2014":t.input],
-      ["out tokens",t.output==null?"\\u2014":t.output],
-      ["cache read",t.cache_read==null?"\\u2014":t.cache_read],
-      ["subscription left",u.remaining+" "+(u.unit||"")],
-    ].map(([k,v])=>'<div class="stat"><span class="mut">'+esc(k)+
-      '</span><b>'+esc(v)+"</b></div>").join("");
-  }catch(e){log(String(e.message));}
-  await loadAccounts();
+    const d=u.sub2api||{};const rows=d.detail||[];
+    document.getElementById("pool_note").textContent=u.extra||"";
+    const trial=rows.filter(r=>r.limit_basis==="weekly-trial").length;
+    document.getElementById("quota_stats").innerHTML=[
+      stat("$","teal","总剩余额度",usd(u.remaining||0),"共 "+esc(rows.length)+" 个账号"),
+      stat("◈","green","总额度",usd(u.total||0),
+        trial?trial+" 个试用账号（按周限额）":"全部按月度额度"),
+      stat("→","violet","已使用",usd(u.used||0),"占总额 "+(
+        u.total>0?Math.round(u.used/(u.total||1)*100)+"%":"\\u2014")),
+      stat("◉","amber","套餐",esc(u.planName||"\\u2014"),esc(u.unit||"USD")),
+    ].join("");
+  }catch(e){log("额度: "+String(e.message));}
+}
+async function loadLocal(){
+  try{
+    const u=await api("/v1/usage");
+    const d=(u.sub2api||{});
+    if(d.requests==null){document.getElementById("local_stats").innerHTML=
+      '<div class="dim" style="font-size:13px">未开启计量库（启动时未配置 --db），无本地计量。</div>';
+      return;}
+    const t=d.tokens||{};
+    const byS=d.by_session||{};
+    const nAcct=Object.keys(byS).length;
+    document.getElementById("local_stats").innerHTML=[
+      stat("✻","teal","请求数",esc(d.requests),nAcct?nAcct+" 个账号有消耗":""),
+      stat("＄","amber","累计成本",usd(d.cost_usd||0),"费率经实测校准"),
+      stat("↑","green","输入 tokens",esc((t.input||0).toLocaleString()),
+        "cache read "+esc((t.cache_read||0).toLocaleString())),
+      stat("↓","violet","输出 tokens",esc((t.output||0).toLocaleString()),
+        "含思考 "+esc((t.reasoning||0).toLocaleString())),
+    ].join("");
+  }catch(e){log("计量: "+String(e.message));}
 }
 async function loadAccounts(){
   let rows=[];
   try{rows=(await api("/admin/api/accounts")).accounts||[];}
   catch(e){log(String(e.message));return;}
+  document.getElementById("acc_count").textContent=rows.length+" 个账号";
+  // Per-account subscription quota (billing basis + monthly fallback) and
+  // per-account 24h metering, joined onto the account list.
+  let usage={},detail={};
+  try{const u=await api("/v1/usage");const d=u.sub2api||{};
+    usage=d.by_session||{};
+    for(const r of (d.detail||[]))detail[r.session_id]=r;
+  }catch(e){}
+  document.getElementById("quota_cards").innerHTML=rows.map(r=>{
+    const q=detail[r.session_id]||{};
+    const s=usage[r.session_id]||{};
+    return quotaCard({email:r.email,total:q.total,used:q.used,remaining:q.remaining,
+      limit_basis:q.limit_basis,monthly_total:q.monthly_total,
+      monthly_remaining:q.monthly_remaining,period_end:q.period_end,
+      cost_usd:s.cost_usd,requests:s.requests});
+  }).join("")||'<div class="dim" style="font-size:13px">还没有账号——用上方「粘贴导入」或「设备码登录」添加第一个。</div>';
   document.getElementById("rows").innerHTML=rows.map(r=>{
-    const s=esc(r.session_id);
-    return "<tr><td>"+s+"</td><td>"+esc(r.email)+"</td><td class=mut>"+
-      esc(r.token)+"</td><td class=mut>"+esc(r.cookies)+"</td>"+
+    const s=esc(r.session_id);const u=usage[r.session_id]||{};
+    const statusCls={alive:"alive",unknown:"unknown",dead:"dead"}[r.status]||"unknown";
+    return "<tr><td>"+esc(r.email||"\\u2014")+"</td><td class=mut style='font-size:12px'>"+s+
+      "</td><td class=mut style='font-size:12px'>"+esc(r.token)+"</td><td class=mut>"+
+      esc(r.cookies)+"</td>"+
       '<td><input value="'+esc(r.max_concurrent)+'" id="m_'+s+'"></td>'+
-      "<td>"+esc(r.status)+"</td><td class=row>"+
-      '<button onclick="saveRow(\\''+s+'\\')">save</button>'+
-      '<button onclick="quota(\\''+s+'\\')">quota</button>'+
-      '<button class=bad onclick="delRow(\\''+s+'\\')">delete</button></td></tr>';
+      '<td><span class="tag '+statusCls+'">'+esc(r.status)+"</span>"+(r.reason&&r.reason!=="ok"
+        ?'<div class="sub">'+esc(r.reason)+"</div>":"")+"</td>"+
+      '<td class="num cost">'+(u.cost_usd!=null?usd(u.cost_usd):"\\u2014")+"</td><td class=row>"+
+      '<button class="sm" onclick="saveRow(\\''+s+'\\')">保存</button>'+
+      '<button class="sm" onclick="quota(\\''+s+'\\')">额度</button>'+
+      '<button class="sm danger" onclick="delRow(\\''+s+'\\')">删除</button></td></tr>';
   }).join("");
 }
 async function pasteImport(){
   const el=document.getElementById("p_text");
   const text=el.value.trim();
-  if(!text){log("\\u5148\\u7c98\\u8d34\\u5185\\u5bb9");return;}
+  if(!text){log("先粘贴内容");return;}
   try{
     const r=await api("/admin/api/accounts/paste",{method:"POST",
       headers:{"content-type":"application/json"},
       body:JSON.stringify({text:text})});
     el.value="";
-    log("\\u5df2\\u5bfc\\u5165 "+r.session_id+(r.email?" ("+r.email+")":"")+
-      " \\u00b7 cookies:"+r.cookies+
+    log("已导入 "+r.session_id+(r.email?" ("+r.email+")":"")+
+      " · cookies:"+r.cookies+
       (r.registered?"":" [session_unregistered: "+r.detail+"]"));
     await loadAll();
   }catch(e){log(String(e.message));}
 }
 let DEV=null;
 async function deviceStart(){
-  if(DEV){log("\\u8bbe\\u5907\\u7801\\u767b\\u5f55\\u5df2\\u5728\\u8fdb\\u884c\\u4e2d");return;}
+  if(DEV){log("设备码登录已在进行中");return;}
   const btn=document.getElementById("dev_btn");btn.disabled=true;DEV="starting";
   try{
     const r=await api("/admin/api/device/start",{method:"POST",
@@ -216,10 +365,10 @@ async function deviceStart(){
     document.getElementById("dev_url").href=r.verification_url;
     document.getElementById("dev_code").textContent=r.user_code;
     document.getElementById("dev_box").style.display="flex";
-    document.getElementById("dev_state").textContent="\\u7b49\\u5f85\\u6388\\u6743\\u2026";
+    document.getElementById("dev_state").textContent="等待授权…";
     try{window.open(r.verification_url,"_blank","noopener");}catch(e){}
-    log("\\u8f93\\u5165\\u9a8c\\u8bc1\\u7801 "+r.user_code+" \\u00b7 "+
-      Math.round(r.expires_in)+"s \\u5185\\u6709\\u6548 \\u00b7 "+r.verification_url);
+    log("输入验证码 "+r.user_code+" · "+Math.round(r.expires_in)+"s 内有效 · "
+      +r.verification_url);
     await devPoll(r.flow_id,Date.now()+r.expires_in*1000);
   }catch(e){log(String(e.message));}
   finally{DEV=null;btn.disabled=false;}
@@ -227,7 +376,7 @@ async function deviceStart(){
 function devCopy(){
   const c=document.getElementById("dev_code").textContent;
   if(navigator.clipboard)navigator.clipboard.writeText(c);
-  log("\\u5df2\\u590d\\u5236 "+c);
+  log("已复制 "+c);
 }
 async function devPoll(id,deadline){
   const st=document.getElementById("dev_state");
@@ -239,19 +388,19 @@ async function devPoll(id,deadline){
       body:JSON.stringify({flow_id:id})});}
     catch(e){const m=String(e.message);
       if(/^(404|410)/.test(m)){st.textContent=m;log(m);return;}
-      st.textContent="\\u8f6e\\u8be2\\u5931\\u8d25\\uff0c\\u91cd\\u8bd5\\u4e2d";continue;}
+      st.textContent="轮询失败，重试中";continue;}
     if(out.status==="ok"){
-      st.textContent="\\u5df2\\u5bfc\\u5165";
+      st.textContent="已导入";
       document.getElementById("dev_box").style.display="none";
-      log("\\u5df2\\u5bfc\\u5165 "+out.session_id+(out.email?" ("+out.email+")":"")+
+      log("已导入 "+out.session_id+(out.email?" ("+out.email+")":"")+
         (out.registered?"":" [session_unregistered: "+out.detail+"]"));
       await loadAll();return;
     }
     if(out.status!=="pending"){st.textContent=out.status;
-      log("\\u8bbe\\u5907\\u7801\\u767b\\u5f55\\u7ed3\\u675f: "+out.status);return;}
+      log("设备码登录结束: "+out.status);return;}
   }
-  st.textContent="\\u5df2\\u8fc7\\u671f";
-  log("\\u8bbe\\u5907\\u7801\\u5df2\\u8fc7\\u671f\\uff0c\\u8bf7\\u91cd\\u65b0\\u5f00\\u59cb");
+  st.textContent="已过期";
+  log("设备码已过期，请重新开始");
 }
 async function addAccount(){
   const body={session_id:document.getElementById("n_sid").value.trim(),
@@ -260,7 +409,7 @@ async function addAccount(){
     max_concurrent:Number(document.getElementById("n_max").value||4)};
   try{await api("/admin/api/accounts",{method:"POST",
     headers:{"content-type":"application/json"},body:JSON.stringify(body)});
-    log("saved "+body.session_id);await loadAccounts();}
+    log("已保存 "+body.session_id);await loadAll();}
   catch(e){log(String(e.message));}
 }
 async function saveRow(sid){
@@ -268,26 +417,29 @@ async function saveRow(sid){
   try{await api("/admin/api/accounts/"+encodeURIComponent(sid),{method:"PATCH",
     headers:{"content-type":"application/json"},
     body:JSON.stringify({max_concurrent:v})});
-    log("updated "+sid);await loadAccounts();}
+    log("已更新 "+sid);await loadAccounts();}
   catch(e){log(String(e.message));}
 }
 async function delRow(sid){
+  if(!confirm("删除账号 "+sid+" ？"))return;
   try{await api("/admin/api/accounts/"+encodeURIComponent(sid),{method:"DELETE"});
-    log("deleted "+sid);await loadAccounts();}
+    log("已删除 "+sid);await loadAll();}
   catch(e){log(String(e.message));}
 }
 async function quota(sid){
   try{const q=await api("/admin/api/accounts/"+encodeURIComponent(sid)+"/quota");
-    log(sid+" \\u2192 "+JSON.stringify(q));}
+    const w=q.weekly_usage||{};
+    log(sid+" → 剩余 $"+(w.remaining!=null?w.remaining:"?")+" / 周限额 $"
+      +(w.limit!=null?w.limit:"?")+" · 重置 "+(w.resets_at||"\\u2014"));}
   catch(e){log(String(e.message));}
 }
 async function doImport(){
   const f=document.getElementById("file").files[0];
-  if(!f){log("pick a file first");return;}
+  if(!f){log("先选择文件");return;}
   try{const payload=JSON.parse(await f.text());
     const r=await api("/admin/api/accounts/import",{method:"POST",
       headers:{"content-type":"application/json"},body:JSON.stringify(payload)});
-    log("imported "+r.imported+", skipped "+r.skipped);await loadAccounts();}
+    log("导入 "+r.imported+" 个，跳过 "+r.skipped+" 个");await loadAll();}
   catch(e){log(String(e.message));}
 }
 async function doExport(){
@@ -295,12 +447,13 @@ async function doExport(){
     const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],
       {type:"application/json"}));
     const a=document.createElement("a");a.href=url;a.download="accounts.json";
-    a.click();URL.revokeObjectURL(url);log("exported "+data.accounts.length+" account(s)");}
+    a.click();URL.revokeObjectURL(url);
+    log("已导出 "+data.accounts.length+" 个账号");}
   catch(e){log(String(e.message));}
 }
 async function doReload(){
   try{const r=await api("/admin/api/reload",{method:"POST"});
-    log("pool reloaded: "+JSON.stringify(r));await loadAll();}
+    log("连接池已重载: "+JSON.stringify(r));await loadAll();}
   catch(e){log(String(e.message));}
 }
 loadAll();

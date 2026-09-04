@@ -728,6 +728,53 @@ async def test_usage_endpoint_requires_api_key(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_usage_endpoint_carries_per_account_metering(monkeypatch, tmp_path):
+    """The payload must bill each account for its own traffic.
+
+    ``by_session`` keys the 24 h metering by ``session_id``; together with
+    ``detail`` (subscription quota per account) the admin UI renders one
+    card per account: spendable quota and what that account cost locally.
+    """
+    from sub2api.core.store import Store
+
+    ch = _channel(_platform_handler())
+    app = _app(monkeypatch, ch)
+    async with _client(app) as c:
+        store = Store(tmp_path / "usage.sqlite3")
+        app.state.usage_store = store
+        try:
+            await store.record_usage(
+                session_id="sess-live",
+                model="m",
+                provider="anthropic",
+                path="/v1/messages",
+                input_tokens=100,
+                output_tokens=50,
+                cost_usd=0.25,
+            )
+            body = (await c.get("/v1/usage")).json()
+        finally:
+            await store.close()
+    block = body["sub2api"]
+    assert block["by_session"]["sess-live"]["cost_usd"] == 0.25
+    assert block["by_session"]["sess-live"]["requests"] == 1
+    # The subscription-quota row carries the pool's account identity too, so
+    # the UI can join quota and metering (this channel runs without a pool,
+    # hence the "single" placeholder identity).
+    assert block["detail"][0]["session_id"] == "single"
+    await ch.close()
+
+
+@pytest.mark.anyio
+async def test_usage_endpoint_omits_by_session_without_metering(monkeypatch):
+    ch = _channel(_platform_handler())
+    async with _client(_app(monkeypatch, ch)) as c:
+        body = (await c.get("/v1/usage")).json()
+    assert "by_session" not in body["sub2api"]
+    await ch.close()
+
+
+@pytest.mark.anyio
 async def test_usage_endpoint_501_for_channel_without_subscription(client):
     """The default echo channel reports no subscription usage."""
     resp = await client.get("/v1/usage")

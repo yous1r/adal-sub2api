@@ -26,18 +26,23 @@ async def local_usage_detail(request: Request) -> dict[str, Any]:
 
     Empty when no store is open (metering off) so the cc-switch payload
     never grows keys that would read as "0 spent" when the truth is
-    "not measured".
+    "not measured".  ``by_session`` repeats the same window per pool
+    account (keyed by ``session_id``) so the admin UI can bill each
+    account for its own traffic; it is absent with the rest when
+    metering is off.
     """
     usage_store = request.app.state.usage_store
     if usage_store is None:
         return {}
     totals = await usage_store.usage_totals(time.time() - USAGE_WINDOW_SECONDS)
+    by_session = await usage_store.usage_by_session(time.time() - USAGE_WINDOW_SECONDS)
     return {
         "requests": totals["requests"],
         "tokens": totals["tokens"],
         "cost_usd": totals["cost_usd"],
         "window": "24h",
         "rate_source": "calibrated",
+        "by_session": by_session,
     }
 
 
