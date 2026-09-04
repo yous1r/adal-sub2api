@@ -77,7 +77,7 @@ python -m sub2api --channel adal-cloud --port 8080 --web
 | `POST /v1/responses` | OpenAI Responses API（`adal-cloud` 透传）：`input` / `model` / `stream` / `reasoning` / `background` 原样透传，SSE 事件 `response.created` → `response.completed` |
 | `GET /v1/responses/{id}` | 获取/轮询已创建的 response 对象（后台推理模式） |
 | `DELETE /v1/responses/{id}` | 删除已存储的 response 对象 |
-| `GET /v1/models` | OpenAI 格式模型列表。`adal-cloud` 下只列**已验证可达**的目录模型（当前 31 个），不列出无法路由的条目 |
+| `GET /v1/models` | OpenAI 格式模型列表。`adal-cloud` 下只列**已验证可达**的模型（当前 28 个），id 与官方原生 id 一致，不列出无法路由的条目 |
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -130,13 +130,13 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 curl http://127.0.0.1:8080/v1/responses \
   -H "Authorization: Bearer sk-sub2api-secret" \
   -H "Content-Type: application/json" \
-  -d '{"model":"openai-gpt-5.6-sol","input":"Plan a 3-day Tokyo itinerary.","stream":false}'
+  -d '{"model":"gpt-5.6-sol","input":"Plan a 3-day Tokyo itinerary.","stream":false}'
 
 # 流式：SSE 事件 response.created → response.output_text.delta → response.completed
 curl http://127.0.0.1:8080/v1/responses \
   -H "Authorization: Bearer sk-sub2api-secret" \
   -H "Content-Type: application/json" \
-  -d '{"model":"openai-gpt-5.6-sol","input":"count 1 2 3","stream":true}'
+  -d '{"model":"gpt-5.6-sol","input":"count 1 2 3","stream":true}'
 
 # 轮询已创建的 response（后台推理模式）
 curl http://127.0.0.1:8080/v1/responses/resp_abc123 \
@@ -176,8 +176,9 @@ Claude Code 的典型表现是：**一次流式 200，随后一片 HTTP 500**。
 
 **4. 模型不可达 = 原生 404** —— 每个 provider 只在**实测 200** 的路径上可达（如 `zai` 只有
 `/v1/messages`，`qwen` 只有 OpenAI 两条），请求打到不支持的组合时按调用方的错误方言回 404，
-而不是转发到默认 provider 换回一个不透明 500。provider 用**最长前缀**解析，
-`chatgpt_web-gpt-5.6-luna` 不会被切成 `chatgpt` 而错发到 Anthropic 主机。
+而不是转发到默认 provider 换回一个不透明 500。provider 优先按**目录查表**解析（原生 id 与
+目录 key 都能查到），查不到时才退回**最长前缀**匹配；`gpt-5.6-luna` 这类原生 id 不会被切成
+`gpt` 这种不存在的 provider，而是明确返回"未知"，交给端点的原生 provider 兜底。
 
 **5. 缓存亲和（`compat/affinity.py`）** —— 从请求的可缓存前缀算出稳定摘要
 （`metadata.user_id` 优先），账号池据此把同一前缀调度回同一账号，命中上游 prompt cache。
@@ -447,19 +448,19 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer sk-sub2api-secret" \
   -H "Content-Type: application/json" \
-  -d '{"model":"openai-gpt-5.6-terra","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="sk-sub2api-secret")
 r = client.chat.completions.create(
-    model="openai-gpt-5.6-terra",
+    model="gpt-5.6-terra",
     messages=[{"role": "user", "content": "hi"}],
 )
 # 流式
 stream = client.chat.completions.create(
-    model="openai-gpt-5.6-terra", messages=[{"role":"user","content":"count 1 2 3"}], stream=True)
+    model="gpt-5.6-terra", messages=[{"role":"user","content":"count 1 2 3"}], stream=True)
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
@@ -472,7 +473,7 @@ export ANTHROPIC_API_KEY=sk-sub2api-secret
 claude   # Claude Code 直连 sub2api /v1/messages
 ```
 
-直连时 `model` 既可填 `/v1/models` 返回的目录 id（如 `openai-gpt-5.6-terra`、`anthropic-claude-sonnet-5`），也可填上游原生 id（如 `gpt-5.6-terra`、`claude-sonnet-5`）——sub2api 自动把目录 id 重写为上游 `model_id`，其余字段原样透传。
+直连时 `model` 直接填官方原生 id（如 `gpt-5.6-terra`、`claude-sonnet-5`）——`/v1/models` 返回的就是这些原生 id，与官方 API 完全一致，为官方端点写的客户端配置无需任何改写。AdaL 目录 key（如 `openai-gpt-5.6-terra`）作为别名继续兼容，只是不再出现在 `/v1/models` 里；`chatgpt_web-*` 三个模型不再对外暴露（与 `openai-*` 同主机同模型，且是唯一的 id 冲突来源），但显式填 `chatgpt_web-gpt-5.6-luna` 这类 key 仍可路由。
 
 #### 经 CLIProxyAPI：多凭证聚合
 
@@ -501,70 +502,37 @@ openai-compatibility:
     api-keys:
       - "sk-sub2api-secret"                    # 与 SUB2API_API_KEY 一致（该值必填，sub2api 默认拒绝匿名启动）
     models:
-      # name = sub2api /v1/models 返回的目录 id；alias = 对客户端暴露的名字
-      # 完整列表见 GET /v1/models；下面列出全部 31 个可达模型
-      - name: "anthropic-claude-sonnet-5"
-        alias: "claude-sonnet-5"
-      - name: "anthropic-claude-sonnet-4-6"
-        alias: "claude-sonnet-4-6"
-      - name: "anthropic-claude-opus-5"
-        alias: "claude-opus-5"
-      - name: "anthropic-claude-opus-4-6"
-        alias: "claude-opus-4-6"
-      - name: "anthropic-claude-fable-5-1"
-        alias: "claude-fable-5-1"
-      - name: "openai-gpt-5.6-terra"
-        alias: "gpt-5.6-terra"
-      - name: "openai-gpt-5.6-luna"
-        alias: "gpt-5.6-luna"
-      - name: "openai-gpt-5.6-sol"
-        alias: "gpt-5.6-sol"
-      - name: "zai-glm-5.3-flash"
-        alias: "glm-5.3-flash"
-      - name: "zai-glm-5.3"
-        alias: "glm-5.3"
-      - name: "zai-glm-5.2"
-        alias: "glm-5.2"
-      - name: "zai-glm-5.1"
-        alias: "glm-5.1"
-      - name: "deepseek-deepseek-v4-flash"
-        alias: "deepseek-v4-flash"
-      - name: "deepseek-deepseek-v4-flash-vision-exp"
-        alias: "deepseek-v4-flash-vision-exp"
-      - name: "deepseek-deepseek-v4-pro"
-        alias: "deepseek-v4-pro"
-      - name: "kimi-kimi-k3"
-        alias: "kimi-k3"
-      - name: "kimi-kimi-k2.7-code"
-        alias: "kimi-k2.7-code"
-      - name: "minimax-MiniMax-M2.7"
-        alias: "MiniMax-M2.7"
-      - name: "minimax-MiniMax-M3"
-        alias: "MiniMax-M3"
-      - name: "xai-grok-4.6"
-        alias: "grok-4.6"
-      - name: "xai-grok-4.5"
-        alias: "grok-4.5"
-      - name: "qwen-qwen3.8-flash"
-        alias: "qwen3.8-flash"
-      - name: "qwen-qwen3.8-max"
-        alias: "qwen3.8-max"
-      - name: "qwen-qwen3.7-max"
-        alias: "qwen3.7-max"
-      - name: "qwen-qwen3.7-plus"
-        alias: "qwen3.7-plus"
-      - name: "meta-muse-spark-1.3"
-        alias: "muse-spark-1.3"
-      - name: "meta-muse-spark-1.2"
-        alias: "muse-spark-1.2"
-      - name: "meta-muse-spark-1.1"
-        alias: "muse-spark-1.1"
-      - name: "chatgpt_web-gpt-5.6-sol"
-        alias: "chatgpt-web-gpt-5.6-sol"
-      - name: "chatgpt_web-gpt-5.6-terra"
-        alias: "chatgpt-web-gpt-5.6-terra"
-      - name: "chatgpt_web-gpt-5.6-luna"
-        alias: "chatgpt-web-gpt-5.6-luna"
+      # name = sub2api /v1/models 返回的 id，已与官方原生 id 一致，
+      # 因此不再需要 alias 改名；仅当想对客户端换个名字时才加 alias。
+      # 完整列表见 GET /v1/models；下面是全部 28 个可达模型
+      - name: "claude-sonnet-5"
+      - name: "claude-sonnet-4-6"
+      - name: "claude-opus-5"
+      - name: "claude-opus-4-6"
+      - name: "claude-fable-5-1"
+      - name: "gpt-5.6-terra"
+      - name: "gpt-5.6-luna"
+      - name: "gpt-5.6-sol"
+      - name: "glm-5.3-flash"
+      - name: "glm-5.3"
+      - name: "glm-5.2"
+      - name: "glm-5.1"
+      - name: "deepseek-v4-flash"
+      - name: "deepseek-v4-flash-vision-exp"
+      - name: "deepseek-v4-pro"
+      - name: "kimi-k3"
+      - name: "kimi-k2.7-code"
+      - name: "MiniMax-M2.7"
+      - name: "MiniMax-M3"
+      - name: "grok-4.6"
+      - name: "grok-4.5"
+      - name: "qwen3.8-flash"
+      - name: "qwen3.8-max"
+      - name: "qwen3.7-max"
+      - name: "qwen3.7-plus"
+      - name: "muse-spark-1.3"
+      - name: "muse-spark-1.2"
+      - name: "muse-spark-1.1"
 ```
 
 客户端调用（OpenAI SDK / curl）：
@@ -612,12 +580,9 @@ claude-api-key:
   - api-key: "sk-sub2api-secret"               # 与 SUB2API_API_KEY 一致
     base-url: "http://127.0.0.1:8080"           # sub2api 根地址（不含 /v1）
     models:
-      - name: "anthropic-claude-sonnet-5"       # sub2api 实际模型名
-        alias: "claude-sonnet-5"                # 对客户端暴露的名字
-      - name: "anthropic-claude-opus-5"
-        alias: "claude-opus-5"
-      - name: "anthropic-claude-sonnet-4-6"
-        alias: "claude-sonnet-4-6"
+      - name: "claude-sonnet-5"                 # 与官方原生 id 一致，无需 alias
+      - name: "claude-opus-5"
+      - name: "claude-sonnet-4-6"
     # sub2api 不做 Claude Code 伪装，关掉 cloak 避免改写请求
     cloak:
       mode: "never"
@@ -652,10 +617,8 @@ openai-compatibility:
     base-url: "http://127.0.0.1:8080/v1"
     api-keys: ["sk-sub2api-secret"]
     models:
-      - name: "anthropic-claude-sonnet-5"
-        alias: "claude-sonnet-5"
-      - name: "openai-gpt-5.6-terra"
-        alias: "gpt-5.6-terra"
+      - name: "claude-sonnet-5"
+      - name: "gpt-5.6-terra"
 
 claude-api-key:
   - api-key: "sk-sub2api-secret"
@@ -663,26 +626,28 @@ claude-api-key:
     cloak:
       mode: "never"
     models:
-      - name: "anthropic-claude-sonnet-5"
-        alias: "claude-sonnet-5"
+      - name: "claude-sonnet-5"
 ```
 
 #### 可用模型清单
 
-`GET /v1/models` 返回 31 个**已验证可达**的目录模型（`<provider>-<model>` 格式）。配置 CLIProxyAPI 时 `name` 字段填这些 id，`alias` 自定义对客户端暴露的名字。"可达路径"列是该 provider 实测 200 的接口，请求打到其他组合会得到原生 404：
+`GET /v1/models` 返回 28 个**已验证可达**的模型，id 与官方原生 id 完全一致（如 `claude-sonnet-5`、`gpt-5.6-terra`）。配置 CLIProxyAPI 时 `name` 字段填这些 id，`alias` 仅在想换名时才需要。"可达路径"列是该 provider 实测 200 的接口，请求打到其他组合会得到原生 404：
 
-| Provider | X-Target-URL | 可达路径 | 模型（sub2api id） |
+| Provider | X-Target-URL | 可达路径 | 模型 id |
 |---|---|---|---|
-| anthropic | `api.anthropic.com` | `/v1/messages` | `anthropic-claude-sonnet-5`, `anthropic-claude-sonnet-4-6`, `anthropic-claude-opus-5`, `anthropic-claude-opus-4-6`, `anthropic-claude-fable-5-1` |
-| openai | `api.openai.com` | `/v1/chat/completions`, `/v1/responses` | `openai-gpt-5.6-terra`, `openai-gpt-5.6-luna`, `openai-gpt-5.6-sol` |
-| chatgpt_web | `api.openai.com` | `/v1/chat/completions`, `/v1/responses` | `chatgpt_web-gpt-5.6-sol`, `chatgpt_web-gpt-5.6-terra`, `chatgpt_web-gpt-5.6-luna` |
-| zai | `api.z.ai/api/anthropic` | `/v1/messages` | `zai-glm-5.3-flash`, `zai-glm-5.3`, `zai-glm-5.2`, `zai-glm-5.1` |
-| deepseek | `api.deepseek.com` | `/v1/chat/completions`, `/v1/responses` | `deepseek-deepseek-v4-flash`, `deepseek-deepseek-v4-flash-vision-exp`, `deepseek-deepseek-v4-pro` |
-| kimi | `api.moonshot.ai` | `/v1/chat/completions`, `/v1/responses` | `kimi-kimi-k3`, `kimi-kimi-k2.7-code` |
-| minimax | `api.minimax.io/anthropic` | `/v1/messages` | `minimax-MiniMax-M2.7`, `minimax-MiniMax-M3` |
-| xai | `api.x.ai` | `/v1/messages`, `/v1/chat/completions`, `/v1/responses` | `xai-grok-4.6`, `xai-grok-4.5` |
-| qwen | `dashscope-intl.aliyuncs.com/compatible-mode` | `/v1/chat/completions`, `/v1/responses` | `qwen-qwen3.8-flash`, `qwen-qwen3.8-max`, `qwen-qwen3.7-max`, `qwen-qwen3.7-plus` |
-| meta | `api.meta.ai` | `/v1/chat/completions`, `/v1/responses` | `meta-muse-spark-1.3`, `meta-muse-spark-1.2`, `meta-muse-spark-1.1` |
+| anthropic | `api.anthropic.com` | `/v1/messages` | `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-opus-5`, `claude-opus-4-6`, `claude-fable-5-1` |
+| openai | `api.openai.com` | `/v1/chat/completions`, `/v1/responses` | `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6-sol` |
+| zai | `api.z.ai/api/anthropic` | `/v1/messages` | `glm-5.3-flash`, `glm-5.3`, `glm-5.2`, `glm-5.1` |
+| deepseek | `api.deepseek.com` | `/v1/chat/completions`, `/v1/responses` | `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `deepseek-v4-pro` |
+| kimi | `api.moonshot.ai` | `/v1/chat/completions`, `/v1/responses` | `kimi-k3`, `kimi-k2.7-code` |
+| minimax | `api.minimax.io/anthropic` | `/v1/messages` | `MiniMax-M2.7`, `MiniMax-M3` |
+| xai | `api.x.ai` | `/v1/messages`, `/v1/chat/completions`, `/v1/responses` | `grok-4.6`, `grok-4.5` |
+| qwen | `dashscope-intl.aliyuncs.com/compatible-mode` | `/v1/chat/completions`, `/v1/responses` | `qwen3.8-flash`, `qwen3.8-max`, `qwen3.7-max`, `qwen3.7-plus` |
+| meta | `api.meta.ai` | `/v1/chat/completions`, `/v1/responses` | `muse-spark-1.3`, `muse-spark-1.2`, `muse-spark-1.1` |
+
+**目录 key 仍兼容**：AdaL 目录里每个条目的 key 是 `<provider>-<model_id>`（如 `openai-gpt-5.6-terra`）。这些 key 作为别名继续被接受并重写为原生 id，只是不再出现在 `/v1/models` 里。
+
+**`chatgpt_web` 已不再暴露**：它把 `openai` 的三个模型（`gpt-5.6-terra/luna/sol`）以第二套 key 重新导出，目标主机与路径都与 `openai` 相同，是原生 id 的唯一冲突来源；改暴露原生 id 后必须择一，保留走官方 API key 的 `openai`。显式填 `chatgpt_web-gpt-5.6-luna` 这类完整 key 仍可路由。
 
 **暂不支持**：目录里的 5 个 `google-gemini-*` 不在上表内，也不会出现在 `/v1/models`。它们的
 OpenAI 兼容层在云端代理上是死路（每种参数组合都回 403 `model_not_allowed`），只有原生
@@ -705,7 +670,7 @@ OpenAI 兼容层在云端代理上是死路（每种参数组合都回 403 `mode
 
 - **401 invalid api key**：CLIProxyAPI 的 `api-keys`/`api-key` 与 sub2api 的 `SUB2API_API_KEY` 不一致。
 - **模型不在列表**：CLIProxyAPI `models[].name` 拼写与 `/v1/models` 返回的 `id` 不符；用 `curl /v1/models` 核对。
-- **`auth_unavailable: no auth available`**：CLIProxyAPI 的 `openai-compatibility.models[]` 里**没有配客户端请求的 model**。CLIProxyAPI 按客户端发的 `model` 匹配 `models[].name` 或 `alias`，匹配不到就报此错。解决：把所有要用的模型都加到 `models[]`（见上方完整 31 个模型配置），或确保客户端请求的 model 名与 `alias` 一致。
+- **`auth_unavailable: no auth available`**：CLIProxyAPI 的 `openai-compatibility.models[]` 里**没有配客户端请求的 model**。CLIProxyAPI 按客户端发的 `model` 匹配 `models[].name` 或 `alias`，匹配不到就报此错。解决：把所有要用的模型都加到 `models[]`（见上方完整 28 个模型配置），或确保客户端请求的 model 名与 `alias` 一致。
 - **`/v1/messages` 走了 OpenAI 上游**：`claude-api-key` 的 `base-url` 不要带 `/v1`，CLIProxyAPI 自己追加 `/v1/messages`。
 - **404 `{"detail":"Not Found"}`**：`base-url` 多带了 `/v1` 导致路径变成 `/v1/v1/messages`。`claude-api-key` 填根地址 `http://127.0.0.1:8080`（不带 `/v1`）。若无法改 CLIProxyAPI 配置，sub2api 也兼容 `/v1/v1/messages` 和 `/v1/v1/chat/completions` 别名。
 - **400 `max_tokens` not supported**：OpenAI 新模型（gpt-5.6-*）只认 `max_completion_tokens`，Responses API 只认 `max_output_tokens`。sub2api 已自动按协议改写，CLIProxyAPI 侧无需改动。
@@ -814,7 +779,7 @@ class MyChannel(BaseChannel):
 ## 测试
 
 ```bash
-pytest -q          # 448 个用例：契约、注册表、会话、聚合、兼容层净化/聚合/错误还原、路由表、费率、计量库、账号池、四个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层、管理界面（含一键导入/设备码流）、CLI
+pytest -q          # 458 个用例：契约、注册表、会话、聚合、兼容层净化/聚合/错误还原、路由表（含原生 id 暴露）、费率、计量库、账号池、四个 AdaL 渠道的解析/参数/子进程端到端、HTTP 全表面、OpenAI 兼容层、管理界面（含一键导入/设备码流）、CLI
 ```
 
 无需安装 AdaL 即可跑全部测试——AdaL 渠道用假运行时（临时启动器脚本）做子进程级验证，SDK 渠道测纯映射函数。

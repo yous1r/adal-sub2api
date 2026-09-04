@@ -109,6 +109,7 @@ from .quota import (
 from .routing import (
     PROVIDER_BASE_URLS,
     PROVIDER_ROUTES,
+    UNLISTED_PROVIDERS,
     ProviderRoute,
     RequestRoute,
     protocol_for,
@@ -147,6 +148,7 @@ __all__ = [
     "TIERS_CACHE_TTL",
     "TOKEN_REFRESH_SKEW",
     "TRANSIENT_COOLDOWN_S",
+    "UNLISTED_PROVIDERS",
     "USAGE_CACHE_TTL",
     "USAGE_FETCH_CONCURRENCY",
     "USAGE_UNIT",

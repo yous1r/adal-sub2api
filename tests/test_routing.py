@@ -11,10 +11,12 @@ from __future__ import annotations
 from sub2api.channels.adal_cloud import (
     PROVIDER_BASE_URLS,
     PROVIDER_ROUTES,
+    UNLISTED_PROVIDERS,
     protocol_for,
     provider_from_key,
     proxy_path_for,
     reachable_models,
+    route_for_request,
 )
 
 # provider -> measured X-Target-URL (the ten reachable rows).
@@ -58,8 +60,9 @@ def test_native_path_matches_the_provider_protocol_family():
 
 
 def test_provider_from_key_longest_prefix_wins():
-    # The old model.split("-", 1)[0] returned "chatgpt", missed every table,
-    # and silently routed an OpenAI request to the Anthropic host.
+    # Whole-prefix matching, not model.split("-", 1)[0]: the split version
+    # turns the now-advertised bare id gpt-5.6-luna into "gpt" and routes it
+    # by a provider that exists in no table.
     assert provider_from_key("chatgpt_web-gpt-5.6-luna") == "chatgpt_web"
     assert provider_from_key("openai-gpt-5.6-terra") == "openai"
     assert provider_from_key("anthropic-claude-sonnet-4-6") == "anthropic"
@@ -126,25 +129,147 @@ def test_protocol_for_unknown_provider_trusts_the_path():
 
 CATALOG = {
     "models": [
-        {"key": "anthropic-claude-sonnet-4-6", "provider": "anthropic"},
-        {"key": "google-gemini-3.7-flash", "provider": "google"},
-        {"key": "chatgpt_web-gpt-5.6-luna", "provider": "chatgpt_web"},
-        {"key": "local-thing", "provider": "openai", "is_local_model": True},
-        {"key": "zai-glm-5.2", "provider": "zai"},
+        {
+            "key": "anthropic-claude-sonnet-4-6",
+            "model_id": "claude-sonnet-4-6",
+            "provider": "anthropic",
+        },
+        {
+            "key": "google-gemini-3.7-flash",
+            "model_id": "gemini-3.7-flash",
+            "provider": "google",
+        },
+        {
+            "key": "chatgpt_web-gpt-5.6-luna",
+            "model_id": "gpt-5.6-luna",
+            "provider": "chatgpt_web",
+        },
+        {
+            "key": "local-thing",
+            "model_id": "thing",
+            "provider": "openai",
+            "is_local_model": True,
+        },
+        {"key": "zai-glm-5.2", "model_id": "glm-5.2", "provider": "zai"},
         {"provider": "anthropic"},
     ]
 }
 
 
+def test_reachable_models_advertises_bare_upstream_ids():
+    # The catalog key is {provider}-{model_id} for all 36 measured entries;
+    # clients configured for the official vendor API send the bare id, so
+    # that is what /v1/models must list.
+    assert reachable_models(CATALOG) == ("claude-sonnet-4-6", "glm-5.2")
+
+
 def test_reachable_models_drops_google_and_local_models():
-    assert reachable_models(CATALOG) == (
-        "anthropic-claude-sonnet-4-6",
-        "chatgpt_web-gpt-5.6-luna",
-        "zai-glm-5.2",
-    )
+    ids = reachable_models(CATALOG)
+    assert "gemini-3.7-flash" not in ids  # no verified route
+    assert "thing" not in ids  # is_local_model
+
+
+def test_reachable_models_drops_unlisted_providers():
+    # chatgpt_web re-exports the openai model ids, so advertising it would
+    # publish gpt-5.6-luna twice pointing at two different routes.
+    assert "chatgpt_web" in UNLISTED_PROVIDERS
+    assert "chatgpt_web" in PROVIDER_ROUTES  # still routable by explicit key
+    assert "gpt-5.6-luna" not in reachable_models(CATALOG)
+
+
+def test_reachable_models_falls_back_to_the_key_without_a_model_id():
+    catalog = {"models": [{"key": "xai-grok-4.6", "provider": "xai"}]}
+    assert reachable_models(catalog) == ("xai-grok-4.6",)
+
+
+def test_reachable_models_deduplicates_repeated_ids():
+    catalog = {
+        "models": [
+            {
+                "key": "openai-gpt-5.6-sol",
+                "model_id": "gpt-5.6-sol",
+                "provider": "openai",
+            },
+            {"key": "kimi-gpt-5.6-sol", "model_id": "gpt-5.6-sol", "provider": "kimi"},
+        ]
+    }
+    assert reachable_models(catalog) == ("gpt-5.6-sol",)
 
 
 def test_reachable_models_tolerates_garbage():
     assert reachable_models({}) == ()
     assert reachable_models({"models": "bogus"}) == ()
     assert reachable_models(None) == ()
+
+
+# -- bare upstream ids route identically to catalog keys ----------------------
+
+
+def test_bare_upstream_id_routes_like_its_catalog_key():
+    # The contract behind advertising bare ids: whatever /v1/models lists must
+    # resolve, and the old prefixed key must keep resolving the same way.
+    for model in ("claude-sonnet-4-6", "anthropic-claude-sonnet-4-6"):
+        route = route_for_request("/v1/messages", {"model": model}, CATALOG)
+        assert route is not None, model
+        assert route.provider == "anthropic"
+        assert route.target_url == "https://api.anthropic.com"
+        assert route.proxy_path == "/v1/messages"
+        assert route.model == "claude-sonnet-4-6"  # always sent bare upstream
+
+
+def test_every_advertised_id_resolves_to_a_route():
+    for model in reachable_models(CATALOG):
+        provider = PROVIDER_ROUTES[
+            next(m["provider"] for m in CATALOG["models"] if m.get("model_id") == model)
+        ]
+        route = route_for_request(provider.native_path, {"model": model}, CATALOG)
+        assert route is not None, model
+        assert route.model == model
+
+
+def test_unlisted_provider_still_routes_by_explicit_key():
+    # chatgpt_web is hidden from /v1/models, not disabled: the explicit key
+    # keeps working so existing configs do not break.
+    route = route_for_request(
+        "/v1/chat/completions", {"model": "chatgpt_web-gpt-5.6-luna"}, CATALOG
+    )
+    assert route is not None
+    assert route.provider == "chatgpt_web"
+    assert route.model == "gpt-5.6-luna"
+
+
+def test_bare_id_shared_with_an_unlisted_provider_prefers_the_listed_one():
+    # gpt-5.6-luna exists under both openai and chatgpt_web in the live
+    # catalog; an unqualified request must land on the advertised route.
+    catalog = {
+        "models": [
+            {
+                "key": "chatgpt_web-gpt-5.6-luna",
+                "model_id": "gpt-5.6-luna",
+                "provider": "chatgpt_web",
+            },
+            {
+                "key": "openai-gpt-5.6-luna",
+                "model_id": "gpt-5.6-luna",
+                "provider": "openai",
+            },
+        ]
+    }
+    route = route_for_request(
+        "/v1/chat/completions", {"model": "gpt-5.6-luna"}, catalog
+    )
+    assert route is not None
+    assert route.provider == "openai"
+
+
+def test_unknown_model_is_refused_when_the_catalog_is_live():
+    assert route_for_request("/v1/messages", {"model": "nope-9"}, CATALOG) is None
+
+
+def test_bare_id_falls_back_to_the_path_provider_when_the_catalog_is_empty():
+    # Offline start: no catalog to look the bare id up in, so the endpoint's
+    # native provider wins rather than refusing every request.
+    route = route_for_request("/v1/messages", {"model": "claude-sonnet-5"}, {})
+    assert route is not None
+    assert route.provider == "anthropic"
+    assert route.model == "claude-sonnet-5"

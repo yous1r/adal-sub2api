@@ -98,6 +98,15 @@ PROVIDER_ROUTES: dict[str, ProviderRoute] = {
     ),
 }
 
+# Providers whose catalog entries are never advertised on ``/v1/models``.
+# ``chatgpt_web`` re-exports the three ``openai`` models under a second key
+# (measured: ``chatgpt_web-gpt-5.6-terra`` and ``openai-gpt-5.6-terra`` share
+# ``model_id: gpt-5.6-terra``).  Publishing upstream ids means those pairs
+# would collide, and the ChatGPT-web route is the worse half: same model, same
+# host, but billed through a scraped web session.  The route row stays so an
+# explicit ``chatgpt_web-`` key still works for anyone who wants it.
+UNLISTED_PROVIDERS: frozenset[str] = frozenset({"chatgpt_web"})
+
 # provider (catalog id) -> upstream target base URL, for passthrough routing.
 PROVIDER_BASE_URLS: dict[str, str] = {
     provider: route.target_url for provider, route in PROVIDER_ROUTES.items()
@@ -108,10 +117,14 @@ def provider_from_key(model: str) -> str | None:
     """Longest provider prefix of a catalog model *key*, or ``None``.
 
     Used only when the catalog has no entry for the requested model (stale
-    cache, offline start).  Longest-match matters: a naive
-    ``model.split("-", 1)[0]`` turns ``chatgpt_web-gpt-5.6-luna`` into
-    ``"chatgpt"``, misses every table, and silently routes an OpenAI request
-    to the Anthropic host.
+    cache, offline start).  Matching whole ``{provider}-`` prefixes against
+    :data:`PROVIDER_ROUTES` — rather than a naive ``model.split("-", 1)[0]`` —
+    is what makes ``None`` reachable: now that ``/v1/models`` advertises bare
+    upstream ids, a splitting version would turn ``gpt-5.6-luna`` into
+    ``"gpt"``, a provider that exists in no table, instead of admitting it
+    cannot tell.  ``None`` lets :func:`route_for_request` fall back to the
+    endpoint's native provider, which is right for a bare id.  Longest-match
+    keeps that sound if a future provider id ever prefixes another.
     """
     best: str | None = None
     for provider in PROVIDER_ROUTES:

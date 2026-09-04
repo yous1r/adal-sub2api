@@ -305,7 +305,7 @@ async def test_channel_refresh_updates_catalog_and_pool(monkeypatch):
 
     await channel.refresh()
 
-    assert channel.models == ("model-a",)
+    assert channel.models == ("a",)  # advertised as the bare upstream id
     assert channel._catalog["models"][0]["model_id"] == "a"
     assert channel._pool.slots[0].token == "new"
     assert channel._pool.slots[0].session_id == "new-sid"

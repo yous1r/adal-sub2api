@@ -19,7 +19,7 @@ from urllib.request import Request
 import httpx
 
 from .auth import ADAL_APP_URL
-from .routing import PROVIDER_ROUTES
+from .routing import PROVIDER_ROUTES, UNLISTED_PROVIDERS
 
 _pkg = sys.modules[__package__]
 
@@ -48,38 +48,62 @@ def catalog_models(catalog: dict[str, Any]) -> tuple[str, ...]:
 
 
 def reachable_models(catalog: dict[str, Any]) -> tuple[str, ...]:
-    """Catalog keys sub2api can actually reach through the proxy.
+    """Upstream model ids sub2api can actually reach through the proxy.
 
-    A catalog entry is advertised only when its provider has a verified
-    route (see :data:`PROVIDER_ROUTES`) and it is not a local-runtime model.
-    This keeps ``/v1/models`` honest: every id it lists resolves to a host
-    the proxy answers 200 for, instead of promising models whose only
-    working surface is one sub2api does not speak yet (``google-*``).
+    Returns the upstream ``model_id`` — ``claude-sonnet-5``, not
+    ``anthropic-claude-sonnet-5`` — so a client configured for the official
+    vendor API needs no rewriting.  Catalog keys keep working on the way in
+    (:func:`upstream_model_id` accepts both), they are simply not advertised.
+
+    An entry is advertised only when its provider has a verified route (see
+    :data:`PROVIDER_ROUTES`), it is not a local-runtime model, and its
+    provider is not in :data:`UNLISTED_PROVIDERS`.  That keeps ``/v1/models``
+    honest — every id resolves to a host the proxy answers 200 for — and
+    keeps it unambiguous, since ``chatgpt_web`` re-exports the ``openai``
+    model ids under a second key.
     """
     models = catalog.get("models") if isinstance(catalog, dict) else None
     if not isinstance(models, list):
         return ()
-    return tuple(
-        m["key"]
-        for m in models
-        if isinstance(m, dict)
-        and m.get("key")
-        and m.get("provider") in PROVIDER_ROUTES
-        and not m.get("is_local_model")
-    )
+    ids: list[str] = []
+    seen: set[str] = set()
+    for m in models:
+        if not isinstance(m, dict) or m.get("is_local_model"):
+            continue
+        provider = m.get("provider")
+        if provider not in PROVIDER_ROUTES or provider in UNLISTED_PROVIDERS:
+            continue
+        model_id = m.get("model_id") or m.get("key")
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        ids.append(model_id)
+    return tuple(ids)
 
 
 def provider_for_model(catalog: dict[str, Any], model: str) -> str | None:
-    """Look up the provider for a model key/id in the catalog."""
+    """Look up the provider for a model key/id in the catalog.
+
+    A catalog ``key`` is explicit and always wins, so ``chatgpt_web-…`` still
+    routes to ``chatgpt_web``.  A bare upstream ``model_id`` resolves to the
+    listed provider: the ids are shared with :data:`UNLISTED_PROVIDERS`, and
+    an unqualified request must land on the advertised route.
+    """
     models = catalog.get("models") if isinstance(catalog, dict) else None
     if not isinstance(models, list):
         return None
+    fallback: str | None = None
     for m in models:
         if not isinstance(m, dict):
             continue
-        if m.get("key") == model or m.get("model_id") == model:
+        if m.get("key") == model:
             return m.get("provider")
-    return None
+        if m.get("model_id") == model:
+            provider = m.get("provider")
+            if provider not in UNLISTED_PROVIDERS:
+                return provider
+            fallback = fallback or provider
+    return fallback
 
 
 def upstream_model_id(catalog: dict[str, Any], model: str) -> str:
