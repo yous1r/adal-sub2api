@@ -156,6 +156,29 @@ CATALOG = {
 }
 
 
+ASTRA_CATALOG = {
+    "models": [
+        {
+            "key": "openai-gpt-6-astra",
+            "model_id": "gpt-6-astra",
+            "provider": "openai",
+            "is_local_model": False,
+        }
+    ]
+}
+
+
+def test_astra_catalog_model_routes_through_openai_protocols():
+    assert reachable_models(ASTRA_CATALOG) == ("gpt-6-astra",)
+    for path in ("/v1/chat/completions", "/v1/responses"):
+        route = route_for_request(path, {"model": "gpt-6-astra"}, ASTRA_CATALOG)
+        assert route is not None
+        assert route.provider == "openai"
+        assert route.target_url == PROVIDER_ROUTES["openai"].target_url
+        assert route.proxy_path == path
+        assert route.model == "gpt-6-astra"
+
+
 def test_reachable_models_advertises_bare_upstream_ids():
     # The catalog key is {provider}-{model_id} for all 36 measured entries;
     # clients configured for the official vendor API send the bare id, so

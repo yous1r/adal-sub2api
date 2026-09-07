@@ -365,6 +365,60 @@ def test_openai_chat_reasoning_effort_untouched_without_tools() -> None:
     assert "reasoning_effort" not in dropped
 
 
+def test_openai_catalog_effort_path_preserves_astra_effort_with_tools() -> None:
+    body = {
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        "reasoning_effort": "high",
+        "messages": [],
+    }
+    dropped: list[str] = []
+    out = sanitize(
+        body,
+        protocol="openai_chat",
+        upstream_model="gpt-6-astra",
+        effort_path="reasoning.effort",
+        effort_options=frozenset({"low", "medium", "high", "xhigh", "max"}),
+        dropped=dropped,
+    )
+    assert out["reasoning"] == {"effort": "high"}
+    assert "reasoning_effort" not in out
+    assert out["reasoning"]["effort"] != "none"
+
+
+def test_openai_catalog_effort_path_uses_none_for_terra_and_sol() -> None:
+    for model in ("gpt-5.6-terra", "gpt-5.6-sol"):
+        dropped: list[str] = []
+        out = sanitize(
+            {
+                "tools": [
+                    {"type": "function", "function": {"name": "f", "parameters": {}}}
+                ],
+                "reasoning_effort": "high",
+                "messages": [],
+            },
+            protocol="openai_chat",
+            upstream_model=model,
+            effort_path="reasoning.effort",
+            effort_options=frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
+            dropped=dropped,
+        )
+        assert out["reasoning"] == {"effort": "none"}
+
+
+def test_openai_catalog_effort_path_drops_invalid_effort() -> None:
+    dropped: list[str] = []
+    out = sanitize(
+        {"reasoning": {"effort": "bogus"}, "messages": []},
+        protocol="responses",
+        upstream_model="gpt-6-astra",
+        effort_path="reasoning.effort",
+        effort_options=frozenset({"low", "medium", "high", "xhigh", "max"}),
+        dropped=dropped,
+    )
+    assert "reasoning" not in out
+    assert "reasoning.effort" in dropped
+
+
 def test_openai_chat_stream_options_injected_on_stream() -> None:
     body = {"stream": True, "messages": []}
     dropped: list[str] = []

@@ -62,7 +62,7 @@ def router(ctx: AppContext) -> APIRouter:
         slot, sid = await channel.acquire_slot(affinity_key(body, route.protocol))
         meter = make_meter(request, route, sid, "/v1/responses", stream)
         if stream:
-            fwd_gen = await forward_to_proxy(
+            fwd_result = await forward_to_proxy(
                 channel=channel,
                 url=url,
                 fwd_body=fwd_body,
@@ -74,7 +74,12 @@ def router(ctx: AppContext) -> APIRouter:
                 protocol=route.protocol,
                 meter=meter,
             )
-            return StreamingResponse(fwd_gen, media_type="text/event-stream")
+            if isinstance(fwd_result, httpx.Response):
+                return JSONResponse(
+                    status_code=fwd_result.status_code,
+                    content=passthrough_json(fwd_result),
+                )
+            return StreamingResponse(fwd_result, media_type="text/event-stream")
         resp = await forward_to_proxy(
             channel=channel,
             url=url,

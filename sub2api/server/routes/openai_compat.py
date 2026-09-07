@@ -9,6 +9,7 @@ branch of this endpoint emits OpenAI chunk frames.
 from __future__ import annotations
 
 import json
+import httpx
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Request
@@ -103,7 +104,7 @@ def router(ctx: AppContext) -> APIRouter:
                 request, route, sid, "/v1/chat/completions", bool(body.stream)
             )
             if body.stream:
-                fwd_gen = await forward_to_proxy(
+                fwd_result = await forward_to_proxy(
                     channel=channel,
                     url=url,
                     fwd_body=fwd_body,
@@ -116,7 +117,12 @@ def router(ctx: AppContext) -> APIRouter:
                     meter=meter,
                     strip_usage_chunk=not wants_usage_chunk(body_dict),
                 )
-                return StreamingResponse(fwd_gen, media_type="text/event-stream")
+                if isinstance(fwd_result, httpx.Response):
+                    return JSONResponse(
+                        status_code=fwd_result.status_code,
+                        content=passthrough_json(fwd_result),
+                    )
+                return StreamingResponse(fwd_result, media_type="text/event-stream")
             # Non-streaming: use a dedicated request with a short read timeout
             # so upstream errors (403/502) return fast instead of hanging.
             resp = await forward_to_proxy(

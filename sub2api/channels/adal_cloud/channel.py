@@ -52,6 +52,33 @@ _pkg = sys.modules[__package__]
 _log = logging.getLogger(__package__)
 
 
+def _effort_config(
+    catalog: dict[str, Any], model: str
+) -> tuple[str | None, frozenset[str] | None]:
+    """Return the catalog-declared effort path and accepted values."""
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return None, None
+    for entry in models:
+        if not isinstance(entry, dict) or model not in (
+            entry.get("key"),
+            entry.get("model_id"),
+        ):
+            continue
+        options = entry.get("config_options")
+        if not isinstance(options, dict):
+            return None, None
+        path = options.get("effort_path")
+        values = options.get("effort")
+        allowed = (
+            frozenset(value for value in values if isinstance(value, str))
+            if isinstance(values, list)
+            else None
+        )
+        return path if isinstance(path, str) else None, allowed
+    return None, None
+
+
 @register
 class AdalCloudChannel(BaseChannel):
     """Direct cloud-proxy channel: no ``adal`` install required.
@@ -604,13 +631,16 @@ class AdalCloudChannel(BaseChannel):
         provider = _pkg.provider_for_model(self._catalog, model) or (
             _pkg.provider_from_key(model) or ""
         )
-        # 2. protocol-specific capability sanitization
+        # 2. Protocol-specific capability sanitization from the live catalog.
+        effort_path, effort_options = _effort_config(self._catalog, model)
         dropped: list[str] = []
         body = sanitize(
             body,
             protocol=_pkg.protocol_for(provider, path),
             upstream_model=upstream or model,
             dropped=dropped,
+            effort_path=effort_path,
+            effort_options=effort_options,
         )
         if dropped:
             changed = True

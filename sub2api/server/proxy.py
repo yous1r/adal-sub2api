@@ -237,6 +237,20 @@ def error_response_for(protocol: str, err: dict) -> tuple[int, dict]:
     return status, oai.openai_error(message, err_type=err_type or "api_error")
 
 
+def _transport_error_body(protocol: str, exc: Exception) -> dict:
+    """Native error envelope for an upstream transport failure.
+
+    A ``ConnectError``/timeout/etc. never produces a response body, so the
+    envelope is synthesized locally.  ``api_error`` maps to 502, turning a
+    transport failure into a structured bad gateway instead of a bare 500.
+    """
+    _status, body = error_response_for(
+        protocol,
+        {"type": "api_error", "message": f"upstream transport error: {exc}"},
+    )
+    return body
+
+
 async def forward_to_proxy(
     *,
     channel: Any,
@@ -253,15 +267,10 @@ async def forward_to_proxy(
 ) -> Any:
     """POST the payload to the cloud proxy with one auth-retry.
 
-    On an HTTP 401 the channel re-mints the bearer from the account's Clerk
-    cookies (:meth:`refresh_slot_auth`) and the request is retried once with
-    rebuilt headers.  Returns the ``httpx.Response`` (non-streaming) or the
-    streaming byte generator; the slot is released exactly once either way.
-
-    In streaming mode the relayed frames are teed into an aggregator so the
-    request can be metered, an ``event: error`` frame marks the slot failed,
-    and ``strip_usage_chunk`` removes the usage-only chunk sub2api asked
-    upstream for but the client did not.
+    Streaming requests are opened before returning.  A non-2xx response is
+    fully read and returned as an ``httpx.Response`` so callers can preserve
+    the upstream status and JSON body; successful responses return a byte
+    generator that owns the open stream.
     """
     client = channel._client
     assert client is not None
@@ -294,73 +303,87 @@ async def forward_to_proxy(
         await channel.release_slot(slot, success=resp.status_code < 500)
         return resp
 
+    stream_cm = None
+    resp: httpx.Response | None = None
+    try:
+        for attempt in range(2):
+            stream_cm = client.stream(
+                "POST",
+                url,
+                content=fwd_body,
+                headers=build_headers(),
+                timeout=_STREAM_TIMEOUT,
+            )
+            resp = await stream_cm.__aenter__()
+            if resp.status_code == 401 and attempt == 0:
+                await resp.aread()
+                await stream_cm.__aexit__(None, None, None)
+                stream_cm = None
+                if await channel.refresh_slot_auth(slot, force=True):
+                    continue
+            break
+        assert resp is not None
+        if not 200 <= resp.status_code < 300:
+            await resp.aread()
+            if stream_cm is not None:
+                await stream_cm.__aexit__(None, None, None)
+                stream_cm = None
+            await channel.release_slot(slot, success=resp.status_code < 500)
+            if meter is not None:
+                meter.record(status=resp.status_code, usage=None)
+            return resp
+    except Exception:
+        if stream_cm is not None:
+            await stream_cm.__aexit__(None, None, None)
+        await channel.release_slot(slot, success=False)
+        if meter is not None:
+            meter.record(status=502, usage=None)
+        raise
+
     async def gen() -> AsyncIterator[bytes]:
         ok = True
-        status = 502
+        status = resp.status_code
         aggregator = aggregator_for(protocol)
         frames: list[dict] = []
         try:
-            for attempt in range(2):
-                retry = False
-                async with client.stream(
-                    "POST",
-                    url,
-                    content=fwd_body,
-                    headers=build_headers(),
-                    timeout=_STREAM_TIMEOUT,
-                ) as resp:
-                    status = resp.status_code
-                    if resp.status_code == 401 and attempt == 0:
-                        retry = True
-                        await resp.aread()  # drain the error body
-                    elif resp.status_code != 200:
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-                    else:
-                        buffer = bytearray()
+            buffer = bytearray()
+            drop_blank = False
+            async for chunk in resp.aiter_bytes():
+                buffer.extend(chunk)
+                while True:
+                    cut = buffer.find(b"\n")
+                    if cut < 0:
+                        break
+                    line = bytes(buffer[: cut + 1])
+                    del buffer[: cut + 1]
+                    if drop_blank and not line.strip():
                         drop_blank = False
-                        async for chunk in resp.aiter_bytes():
-                            buffer.extend(chunk)
-                            while True:
-                                cut = buffer.find(b"\n")
-                                if cut < 0:
-                                    break
-                                line = bytes(buffer[: cut + 1])
-                                del buffer[: cut + 1]
-                                if drop_blank and not line.strip():
-                                    drop_blank = False
-                                    continue
-                                drop_blank = False
-                                frame = _decode_data_line(line)
-                                if frame is not None:
-                                    frames.append(frame)
-                                    aggregator.feed(frame)
-                                    if strip_usage_chunk and _is_usage_only_chunk(
-                                        frame
-                                    ):
-                                        drop_blank = True
-                                        continue
-                                yield line
-                        if buffer:
-                            frame = _decode_data_line(bytes(buffer))
-                            if frame is not None:
-                                frames.append(frame)
-                                aggregator.feed(frame)
-                            yield bytes(buffer)
-                if retry and await channel.refresh_slot_auth(slot, force=True):
-                    continue
-                break
+                        continue
+                    drop_blank = False
+                    frame = _decode_data_line(line)
+                    if frame is not None:
+                        frames.append(frame)
+                        aggregator.feed(frame)
+                        if strip_usage_chunk and _is_usage_only_chunk(frame):
+                            drop_blank = True
+                            continue
+                    yield line
+            if buffer:
+                frame = _decode_data_line(bytes(buffer))
+                if frame is not None:
+                    frames.append(frame)
+                    aggregator.feed(frame)
+                yield bytes(buffer)
         except Exception:
             ok = False
             raise
         finally:
             err = parse_error_frame(frames)
             if err is not None or status >= 500:
-                # An `event: error` inside a 200 stream is a real failure; not
-                # marking it pollutes slot health and hides the cause.
                 ok = False
                 if err is not None:
                     status, _body = error_response_for(protocol, err)
+            await stream_cm.__aexit__(None, None, None)
             await channel.release_slot(slot, success=ok)
             if meter is not None:
                 meter.record(status=status, usage=aggregator.usage())

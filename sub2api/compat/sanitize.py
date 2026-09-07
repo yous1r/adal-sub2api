@@ -34,17 +34,56 @@ _SYNTHETIC_INPUT_SCHEMA = {
 
 
 def sanitize(
-    body: dict, *, protocol: str, upstream_model: str, dropped: list[str]
+    body: dict,
+    *,
+    protocol: str,
+    upstream_model: str,
+    dropped: list[str],
+    effort_path: str | None = None,
+    effort_options: frozenset[str] | None = None,
 ) -> dict:
     """Return a sanitized shallow copy of `body`; append removed/rewritten field names to `dropped`."""
     out = dict(body)
     if protocol == "anthropic":
         _sanitize_anthropic(out, upstream_model, dropped)
     elif protocol == "openai_chat":
-        _sanitize_openai_chat(out, dropped)
+        _sanitize_openai_chat(out, dropped, effort_path, effort_options)
     elif protocol == "responses":
-        _sanitize_responses(out, dropped)
+        _sanitize_responses(out, dropped, effort_path, effort_options)
     return out
+
+
+def _sanitize_reasoning(
+    out: dict,
+    dropped: list[str],
+    effort_path: str | None,
+    effort_options: frozenset[str] | None,
+) -> None:
+    """Normalize and validate catalog-declared reasoning effort fields."""
+    if effort_path != "reasoning.effort":
+        return
+    reasoning = out.get("reasoning")
+    if not isinstance(reasoning, dict):
+        reasoning = {}
+    else:
+        reasoning = dict(reasoning)
+    flat = out.pop("reasoning_effort", None)
+    if flat is not None:
+        dropped.append("reasoning_effort")
+    if "effort" not in reasoning and flat is not None:
+        reasoning["effort"] = flat
+    effort = reasoning.get("effort")
+    if (
+        effort_options is not None
+        and effort is not None
+        and effort not in effort_options
+    ):
+        reasoning.pop("effort", None)
+        dropped.append("reasoning.effort")
+    if reasoning:
+        out["reasoning"] = reasoning
+    elif "reasoning" in out:
+        out.pop("reasoning")
 
 
 def _sanitize_anthropic(out: dict, upstream_model: str, dropped: list[str]) -> None:
@@ -117,7 +156,12 @@ def _fix_tool(tool: object, index: int, dropped: list[str]) -> object:
     return fixed
 
 
-def _sanitize_openai_chat(out: dict, dropped: list[str]) -> None:
+def _sanitize_openai_chat(
+    out: dict,
+    dropped: list[str],
+    effort_path: str | None,
+    effort_options: frozenset[str] | None,
+) -> None:
     if "max_tokens" in out:
         value = out.pop("max_tokens")
         dropped.append("max_tokens")
@@ -138,9 +182,17 @@ def _sanitize_openai_chat(out: dict, dropped: list[str]) -> None:
         if serialized is not None and "json" not in serialized.lower():
             del out["response_format"]
             dropped.append("response_format")
+    _sanitize_reasoning(out, dropped, effort_path, effort_options)
     if isinstance(out.get("tools"), list) and out["tools"]:
-        out["reasoning_effort"] = "none"
-        dropped.append("reasoning_effort")
+        if effort_options is None or "none" in effort_options:
+            if effort_path == "reasoning.effort":
+                reasoning = dict(out.get("reasoning") or {})
+                reasoning["effort"] = "none"
+                out["reasoning"] = reasoning
+                dropped.append("reasoning.effort")
+            else:
+                out["reasoning_effort"] = "none"
+                dropped.append("reasoning_effort")
     if out.get("stream"):
         stream_options = (
             dict(out["stream_options"])
@@ -153,7 +205,12 @@ def _sanitize_openai_chat(out: dict, dropped: list[str]) -> None:
             dropped.append("stream_options")
 
 
-def _sanitize_responses(out: dict, dropped: list[str]) -> None:
+def _sanitize_responses(
+    out: dict,
+    dropped: list[str],
+    effort_path: str | None,
+    effort_options: frozenset[str] | None,
+) -> None:
     if "max_output_tokens" not in out:
         for key in ("max_tokens", "max_completion_tokens"):
             if key in out:
@@ -173,3 +230,4 @@ def _sanitize_responses(out: dict, dropped: list[str]) -> None:
         if key in out:
             del out[key]
             dropped.append(key)
+    _sanitize_reasoning(out, dropped, effort_path, effort_options)
