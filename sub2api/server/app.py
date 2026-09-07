@@ -5,16 +5,17 @@ speaks ChatRequest/Event. All channel-specific behavior lives behind
 the registry.
 
 Assembly only: the channel, the session store, the lifespan-owned metering
-store and credit-sync task live here, while every route lives in
-``server/routes/*`` behind a ``router(ctx)`` factory.  ``create_channel`` stays
-a module global of *this* module because tests rebind it by attribute.
+store and the background :class:`~sub2api.core.scheduler.Scheduler` (periodic
+model-catalog refresh, credit/subscription sync) live here, while every route
+lives in ``server/routes/*`` behind a ``router(ctx)`` factory.
+``create_channel`` stays a module global of *this* module because tests
+rebind it by attribute.
 """
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
@@ -24,30 +25,10 @@ from ..core.config import AppSettings
 from ..core.registry import create_channel
 from ..core.sessions import SessionStore
 from ..core.store import Store
+from ..core.scheduler import Scheduler
 from .deps import AppContext
 from .routes import admin, anthropic, chat, models, openai_compat, responses, usage
 
-CREDIT_SYNC_INTERVAL = 600.0
-
-
-async def credit_sync_loop(
-    channel: Any, usage_store: Store, interval: float = CREDIT_SYNC_INTERVAL
-) -> None:
-    """Poll every account's credit balance forever, starting immediately.
-
-    Runs as a lifespan task so ``usage_limited`` is known before the first
-    request instead of being discovered by burning one.  Every failure is
-    swallowed: a credit probe must never take the gateway down, and the next
-    tick retries anyway.
-    """
-    while True:
-        try:
-            await channel.refresh_credits(usage_store)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - a probe failure is not fatal
-            pass
-        await asyncio.sleep(interval)
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
@@ -62,23 +43,23 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         # database file.  A store that cannot be opened degrades to no
         # metering rather than refusing to serve.
         usage_store: Store | None = None
-        credit_task: asyncio.Task | None = None
         try:
             usage_store = Store(settings.db or None)
         except (sqlite3.Error, OSError):
             usage_store = None
         app.state.usage_store = usage_store
+        # The channel reads the catalog cache (and the scheduler writes it)
+        # through this store; channels without catalog support ignore it.
+        if usage_store is not None and hasattr(channel, "_store"):
+            channel._store = usage_store
         await channel.start()
-        if usage_store is not None and hasattr(channel, "refresh_credits"):
-            credit_task = asyncio.create_task(credit_sync_loop(channel, usage_store))
-            app.state.credit_task = credit_task
+        scheduler = Scheduler(channel, usage_store)
+        scheduler.start()
+        app.state.scheduler = scheduler
         try:
             yield
         finally:
-            if credit_task is not None:
-                credit_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await credit_task
+            await scheduler.stop()
             await channel.close()
             if usage_store is not None:
                 await usage_store.close()
@@ -94,7 +75,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.channel = channel
     app.state.store = store
     app.state.usage_store = None
-    app.state.credit_task = None
+    app.state.scheduler = None
 
     ctx = AppContext(settings=settings, channel=channel, store=store)
     # Registration order mirrors the pre-split app; each alias travels with the

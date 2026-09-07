@@ -77,6 +77,7 @@ class AdalCloudChannel(BaseChannel):
     _pool: Any | None
     _proxy_sid: str | None
     _usage_cache: tuple[float, dict[str, Any]] | None
+    _store: Any | None
     _tiers_cache: tuple[float, dict[str, Any]] | None
 
     def __init__(self, config: Any) -> None:
@@ -93,6 +94,7 @@ class AdalCloudChannel(BaseChannel):
         self._usage_cache = None
         self._tiers_cache = None
         self._usage_lock = asyncio.Lock()
+        self._store = None
 
     @staticmethod
     def _pool_signature_for(config: PoolConfig | None) -> tuple[Any, ...] | None:
@@ -109,22 +111,29 @@ class AdalCloudChannel(BaseChannel):
         )
 
     async def refresh(self) -> None:
-        """Refresh the catalog and adopt changed pool definitions safely."""
+        """Adopt changed pool definitions; serve models from the DB cache.
+
+        Called on the request path (models listing, chat, passthrough), so
+        it must never touch the network: the catalog lives in the SQLite
+        store (see :meth:`refresh_catalog_from_upstream`, driven by the
+        background task in ``server.app``).  Pool config is re-read from
+        disk/DB so admin edits apply without a restart.
+        """
         if not self.started:
             return
+        if not self._catalog:
+            # With a store: read the cached catalog only (no network on the
+            # request path).  Without one: a one-time network fetch keeps the
+            # original behavior for store-less deployments and tests.
+            catalog = await self._store.load_catalog() if self._store is not None else {}
+            if not catalog and self._store is None:
+                catalog = await asyncio.to_thread(_pkg.fetch_catalog, self.proxy_url)
+            if catalog:
+                self._adopt_catalog(catalog)
         async with self._refresh_lock:
             config = await asyncio.to_thread(_pkg.load_pool_config)
             signature = self._pool_signature_for(config)
-            pool_changed = signature != self._pool_signature
-            if not pool_changed:
-                if self._pool is None:
-                    catalog = await asyncio.to_thread(
-                        _pkg.fetch_catalog, self.proxy_url
-                    )
-                    models = _pkg.reachable_models(catalog)
-                    if models:
-                        self._catalog = catalog
-                        self.models = models
+            if signature == self._pool_signature:
                 return
             if config is None or not config.accounts:
                 if self._pool is not None and not await self._pool.close_if_idle():
@@ -149,11 +158,6 @@ class AdalCloudChannel(BaseChannel):
                     self._client.headers.pop("Authorization", None)
             elif not await self._pool.reconfigure(config):
                 return
-            catalog = await asyncio.to_thread(_pkg.fetch_catalog, self.proxy_url)
-            models = _pkg.reachable_models(catalog)
-            if models:
-                self._catalog = catalog
-                self.models = models
             self._pool_signature = signature
             active_sessions = {slot.session_id for slot in self._pool.slots}
             self._registered.intersection_update(active_sessions)
@@ -170,6 +174,32 @@ class AdalCloudChannel(BaseChannel):
                         self._registered.add(slot.session_id)
                     except AuthError:
                         pass
+
+    def _adopt_catalog(self, catalog: dict[str, Any]) -> None:
+        """Swap in a fetched catalog; empty fetches keep the current one."""
+        models = _pkg.reachable_models(catalog)
+        if models:
+            self._catalog = catalog
+            self.models = models
+
+    async def refresh_catalog_from_upstream(
+        self, store: Any = None
+    ) -> tuple[str, ...]:
+        """Fetch the live catalog over the network, cache it in the store.
+
+        Runs on the background timer (``server.app.catalog_refresh_loop``),
+        never on the request path.  Returns the newly advertised model ids;
+        an empty tuple means the fetch failed and the previous catalog
+        (memory or store) stays authoritative.
+        """
+        catalog = await asyncio.to_thread(_pkg.fetch_catalog, self.proxy_url)
+        if not catalog:
+            return ()
+        self._adopt_catalog(catalog)
+        target = store if store is not None else self._store
+        if target is not None:
+            await target.save_catalog(catalog)
+        return self.models
 
     # -- token lifecycle ---------------------------------------------------
 
@@ -258,11 +288,17 @@ class AdalCloudChannel(BaseChannel):
     # -- lifecycle ---------------------------------------------------------
 
     async def _start(self) -> None:
-        catalog = await asyncio.to_thread(_pkg.fetch_catalog)
-        models = _pkg.reachable_models(catalog)
-        if models:
-            self.models = models
-        self._catalog = catalog
+        # Catalog: DB cache first (instant, offline-safe), network fetch only
+        # when the cache is cold.  The background task in server.app keeps it
+        # fresh afterwards.
+        catalog: dict[str, Any] = {}
+        if self._store is not None:
+            catalog = await self._store.load_catalog() or {}
+        if not catalog:
+            catalog = await asyncio.to_thread(_pkg.fetch_catalog)
+            if catalog and self._store is not None:
+                await self._store.save_catalog(catalog)
+        self._adopt_catalog(catalog)
         # Resolve auth token: explicit config wins, then cached creds. If the
         # cached token is expired we still try it — the proxy may accept it
         # (it keys off the session_id, not the bearer, for /proxy/*). Only run
@@ -271,6 +307,7 @@ class AdalCloudChannel(BaseChannel):
         if not token:
             token = await asyncio.to_thread(_pkg.device_flow_login)
         self._token = token
+
         # Multi-account pool: when configured, the pool owns per-account tokens
         # and sessions. The shared httpx client is token-agnostic (the
         # Authorization header is set per-request from the acquired slot).

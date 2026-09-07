@@ -325,6 +325,69 @@ async def test_channel_refresh_keeps_old_catalog_on_fetch_failure(monkeypatch):
     assert channel._catalog["models"][0]["key"] == "old"
 
 
+@pytest.mark.anyio
+async def test_refresh_uses_store_cache_without_network(monkeypatch):
+    """Request-path refresh reads the SQLite cache; no network call happens."""
+    import sub2api.channels.adal_cloud as mod
+    from sub2api.core.store import Store
+
+    store = Store(tmp_catalog_db())
+    await store.save_catalog(SAMPLE_CATALOG)
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    channel._store = store
+
+    def fail(*a, **k):
+        raise AssertionError("refresh() must not touch the network")
+
+    monkeypatch.setattr(mod, "fetch_catalog", fail)
+    await channel.refresh()
+    assert channel.models == ("claude-sonnet-5", "gpt-5.6-terra", "glm-5.2")
+    await store.close()
+
+
+@pytest.mark.anyio
+async def test_refresh_catalog_from_upstream_adopts_and_caches(monkeypatch):
+    """The scheduler-driven fetch adopts new models and writes the cache."""
+    import sub2api.channels.adal_cloud as mod
+    from sub2api.core.store import Store
+
+    store = Store(tmp_catalog_db())
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    channel._store = store
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *a: SAMPLE_CATALOG)
+
+    models = await channel.refresh_catalog_from_upstream()
+
+    assert models == ("claude-sonnet-5", "gpt-5.6-terra", "glm-5.2")
+    cached = await store.load_catalog()
+    assert cached == SAMPLE_CATALOG
+    await store.close()
+
+
+@pytest.mark.anyio
+async def test_refresh_catalog_from_upstream_keeps_state_on_failure(monkeypatch):
+    import sub2api.channels.adal_cloud as mod
+
+    channel = mod.AdalCloudChannel(ChannelConfig())
+    channel._started = True
+    channel._catalog = {"models": [{"key": "old", "provider": "anthropic"}]}
+    channel.models = ("old",)
+    monkeypatch.setattr(mod, "fetch_catalog", lambda *a: {})
+
+    assert await channel.refresh_catalog_from_upstream() == ()
+    assert channel.models == ("old",)
+
+
+def tmp_catalog_db():
+    import tempfile
+
+    from pathlib import Path as _P
+
+    return _P(tempfile.mkdtemp()) / "catalog.sqlite3"
+
+
 def test_register_session_posts_and_succeeds(monkeypatch):
 
     calls = []

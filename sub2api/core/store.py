@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS credit_snapshots (
     is_usage_limited INTEGER NOT NULL DEFAULT 0, limit_reason TEXT NOT NULL DEFAULT '',
     resets_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (session_id, ts));
 CREATE TABLE IF NOT EXISTS pool_settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS catalog_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at REAL NOT NULL);
 """
 
 _USAGE_COLUMNS = (
@@ -359,6 +360,43 @@ class Store:
             )
 
         return await asyncio.to_thread(run)
+
+    # -- catalog -------------------------------------------------------------
+
+    async def load_catalog(self, key: str = "adal") -> dict[str, Any] | None:
+        """Last cached model catalog JSON for ``key``, or ``None``."""
+
+        def run() -> dict[str, Any] | None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT v FROM catalog_cache WHERE k = ?", (key,)
+                ).fetchone()
+            if row is None:
+                return None
+            try:
+                parsed = json.loads(row["v"])
+            except ValueError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+
+        return await asyncio.to_thread(run)
+
+    async def save_catalog(self, catalog: dict[str, Any], key: str = "adal") -> None:
+        """Persist the model catalog JSON under ``key``."""
+
+        def run() -> None:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO catalog_cache (k, v, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(k) DO UPDATE SET
+                        v = excluded.v, updated_at = excluded.updated_at
+                    """,
+                    (key, json.dumps(catalog), time.time()),
+                )
+                self._conn.commit()
+
+        await asyncio.to_thread(run)
 
     # -- usage ---------------------------------------------------------------
 
