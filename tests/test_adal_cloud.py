@@ -588,6 +588,35 @@ def test_route_for_openai():
     assert model == "gpt-5.6-terra"
 
 
+def test_rewrite_body_uses_catalog_effort_path_for_astra_tools():
+    ch = AdalCloudChannel(ChannelConfig())
+    ch._catalog = {
+        "models": [
+            {
+                "key": "openai-gpt-6-astra",
+                "model_id": "gpt-6-astra",
+                "provider": "openai",
+                "config_options": {
+                    "effort": ["low", "medium", "high", "xhigh", "max"],
+                    "effort_path": "reasoning.effort",
+                },
+            }
+        ]
+    }
+    body = {
+        "model": "openai-gpt-6-astra",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        "reasoning_effort": "high",
+    }
+    rewritten = json.loads(
+        ch.rewrite_body(json.dumps(body).encode(), "/v1/chat/completions")
+    )
+    assert rewritten["model"] == "gpt-6-astra"
+    assert rewritten["reasoning"] == {"effort": "high"}
+    assert "reasoning_effort" not in rewritten
+
+
 def test_route_for_unknown_model_falls_back_to_anthropic():
     ch = AdalCloudChannel(ChannelConfig())
     ch._catalog = SAMPLE_CATALOG
