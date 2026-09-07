@@ -8,6 +8,7 @@ Non-stream requests deliberately do not use a non-stream upstream POST — see
 from __future__ import annotations
 
 import json
+import httpx
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -15,7 +16,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ...compat.affinity import affinity_key
 from ...compat.errors import anthropic_error
 from ..auth import unauthorized
-from ..deps import AppContext, make_meter, model_not_found, parse_body
+from ..deps import (
+    AppContext,
+    make_meter,
+    model_not_found,
+    parse_body,
+    passthrough_json,
+)
 from ..proxy import forward_collect, forward_to_proxy
 
 
@@ -51,7 +58,7 @@ def router(ctx: AppContext) -> APIRouter:
         slot, sid = await channel.acquire_slot(affinity_key(body, route.protocol))
         meter = make_meter(request, route, sid, "/v1/messages", stream)
         if stream:
-            fwd_gen = await forward_to_proxy(
+            fwd_result = await forward_to_proxy(
                 channel=channel,
                 url=url,
                 fwd_body=fwd_body,
@@ -63,7 +70,12 @@ def router(ctx: AppContext) -> APIRouter:
                 protocol=route.protocol,
                 meter=meter,
             )
-            return StreamingResponse(fwd_gen, media_type="text/event-stream")
+            if isinstance(fwd_result, httpx.Response):
+                return JSONResponse(
+                    status_code=fwd_result.status_code,
+                    content=passthrough_json(fwd_result),
+                )
+            return StreamingResponse(fwd_result, media_type="text/event-stream")
         status, payload = await forward_collect(
             channel=channel,
             url=url,
