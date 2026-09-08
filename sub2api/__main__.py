@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--responses-only",
         action="store_true",
-        help="serve only the Responses API ingress (also SUB2API_RESPONSES_ONLY=1)",
+        help="use Responses upstream, bridging Chat Completions (also SUB2API_RESPONSES_ONLY=1)",
     )
     parser.add_argument(
         "--db",

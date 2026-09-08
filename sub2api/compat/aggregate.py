@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # SSE decoding
 # ---------------------------------------------------------------------------
@@ -342,20 +341,21 @@ class OpenAIChatAggregator:
 class ResponsesAggregator:
     """Rebuilds a ``/v1/responses`` object from streamed response events.
 
-    ``response.completed`` carries the finished ``response`` verbatim; the
-    incremental events (``output_item.added`` / ``output_text.delta`` /
-    ``output_item.done``) are the fallback used when the terminal event is
-    never seen.
+    Terminal events carry the finished ``response`` verbatim; incremental
+    events (``output_item.added`` / ``output_text.delta`` / ``output_item.done``)
+    are the fallback used when the terminal event is never seen.
     """
 
     def __init__(self) -> None:
         self._completed: dict | None = None
         self._response: dict = {}
         self._items: list[Any] = []
+        self.terminal = False
 
     def feed(self, frame: dict) -> None:
         etype = frame.get("type")
-        if etype == "response.completed":
+        if etype in ("response.completed", "response.incomplete", "response.failed"):
+            self.terminal = True
             response = frame.get("response")
             if isinstance(response, dict):
                 self._completed = response
@@ -398,7 +398,7 @@ class ResponsesAggregator:
                 self._items.append(None)
             self._items[index] = dict(item)
             return
-        # usage arrives inside response.completed; other event types ignored
+        # Usage arrives inside terminal response events; other events ignored.
 
     def _last_text_item(self, output_index: int | None) -> dict | None:
         if output_index is not None:

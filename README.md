@@ -421,13 +421,13 @@ python -m sub2api --help
 | `--channel` | `SUB2API_CHANNEL` 或 `echo` | 激活渠道 |
 | `--web` | 关 | 挂载 `/admin` 管理界面 |
 | `--db PATH` | `SUB2API_DB` 或 `~/.adal/sub2api.sqlite3` | SQLite 路径；同时导出 `SUB2API_DB`，让计量库与账号来源始终是同一个文件 |
-| `--responses-only` | 关；`SUB2API_RESPONSES_ONLY=1` 时开启 | 仅开放 Responses 推理入口；非 Responses 推理路由及其兼容别名返回 404 |
+| `--responses-only` | 关；`SUB2API_RESPONSES_ONLY=1` 时开启 | 强制使用 Responses 上游；Chat Completions 入口双向转换协议，其他非 Responses 推理入口返回 404 |
 
 **默认拒绝匿名启动**：没有 `SUB2API_API_KEY` 时进程直接退出（exit 2）并提示——
 一个不设 key 的网关等于把订阅额度（开了 `--web` 还包括凭证）交给任何能连上端口的人。
 确实要开放时显式设 `SUB2API_ALLOW_ANONYMOUS=1`。该检查只在启动监听时生效，构造 app 对象不受影响。
 
-#### 临时只开放 Responses 推理入口
+#### 临时强制使用 Responses 上游
 
 在**原有启动命令末尾追加 `--responses-only`**，或在启动前设置环境变量；端口、API key、渠道和数据库配置保持不变：
 
@@ -437,16 +437,19 @@ $env:SUB2API_RESPONSES_ONLY = "1"
 ```
 
 - 保留 `POST /v1/responses`、`POST /v1/v1/responses`，以及 `GET` / `DELETE /v1/responses/{id}`，原有鉴权不变。
-- 关闭 Chat Completions 及其兼容别名、自有 `/v1/chat` / `/v1/chat/stream`、Anthropic `/v1/messages` 及其别名和 token 计数入口；这些路径均返回 404，不调用上游。
+- 保留 Chat Completions 及其兼容别名：`POST /v1/chat/completions`、`POST /v1/v1/chat/completions`、`POST /v1/completions`。收到 Chat 请求后转换消息、图片/文件、函数工具及工具结果，调用上游 `/v1/responses`，再将结果转换回 **Chat JSON 或 Chat SSE**。这不是 HTTP 重定向，也不是仅替换 URL。
+- 保留 `reasoning_effort` / `reasoning.effort` 设置，不会因为存在工具而强制改成 `none`。上游提供的 reasoning 摘要会通过 Chat 的 `reasoning_content` 返回；Chat 链路不能保证无损回传 Responses 的加密 reasoning 状态，不会伪造这类状态。
+- 关闭自有 `/v1/chat` / `/v1/chat/stream`、Anthropic `/v1/messages` / `/v1/v1/messages` 和 `/v1/messages/count_tokens`；这些路径返回 404，不调用上游。
 - 模型列表、健康检查、用量查询和管理界面不受影响。
-- 这是入口隔离开关，**不会把 Chat 请求转换为 Responses，也不会强制 CLIProxyAPI 自动切换协议**。CLIProxyAPI 若继续向 Chat 端点发请求，会收到 404。
+- CLIProxyAPI 不需要在这一跳切换协议：它仍可发送 Chat 请求并接收 Chat 格式，sub2api 负责 Responses 桥接。不能等价表示的选项（如 `n > 1`、`stop`、音频输出）返回明确的 400，而不是静默忽略。
+- 需要渠道及目标模型支持 Responses 透传；不支持透传的渠道返回 501，不会用普通 Chat 调用冒充 Responses。
 
 开关只在启动时读取。恢复时，移除 `--responses-only`，并删除 `SUB2API_RESPONSES_ONLY` 或将其设为 `"0"`，再重启进程。默认未开启该开关时，所有原有路由照常提供。
 
 
 ### CLIProxyAPI 接入详细指南
 
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 同时支持 OpenAI 与 Anthropic 两种上游协议，可以把 sub2api 当作一个自建上游接入，再对外统一暴露 OpenAI / Claude / Gemini 兼容端点。`adal-cloud` 渠道下 sub2api 原样透传上游响应，CLIProxyAPI 负责按客户端格式分发，**sub2api 不解析 SSE**。
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 同时支持 OpenAI 与 Anthropic 两种上游协议，可以把 sub2api 当作一个自建上游接入，再对外统一暴露 OpenAI / Claude / Gemini 兼容端点。`adal-cloud` 渠道默认按原协议透传；启用 `--responses-only` 后，Chat Completions 请求会在 sub2api 内双向转换为 Responses，CLIProxyAPI 这一跳仍使用 Chat 格式。
 
 #### 前置：启动 sub2api
 

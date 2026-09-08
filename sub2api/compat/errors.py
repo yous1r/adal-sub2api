@@ -28,7 +28,7 @@ _UNCLASSIFIED: dict[str, str] = {"type": "api_error", "message": "upstream error
 
 
 def parse_error_frame(frames: list[dict]) -> dict | None:
-    """Return the ``error`` object from the first ``{"type": "error"}`` frame.
+    """Return the first Anthropic or Responses stream error object.
 
     ``frames`` are decoded SSE ``data:`` payloads. Returns ``None`` when no
     frame carries an error. A frame whose ``error`` value is missing, not a
@@ -37,15 +37,40 @@ def parse_error_frame(frames: list[dict]) -> dict | None:
     unshaped dict to callers.
     """
     for frame in frames:
-        if not isinstance(frame, dict) or frame.get("type") != "error":
+        if not isinstance(frame, dict):
             continue
-        error = frame.get("error")
+        event_type = frame.get("type")
+        if event_type == "response.failed":
+            response = frame.get("response")
+            error = response.get("error") if isinstance(response, dict) else None
+        elif event_type in ("error", "response.error"):
+            error = frame.get("error")
+            if error is None and isinstance(frame.get("message"), str):
+                error = {
+                    key: frame[key]
+                    for key in ("message", "code", "param")
+                    if key in frame
+                }
+        else:
+            continue
         if (
             isinstance(error, dict)
             and isinstance(error.get("type"), str)
             and error["type"]
         ):
             return error
+        if (
+            isinstance(error, dict)
+            and isinstance(error.get("message"), str)
+            and error["message"]
+        ):
+            normalized = dict(error)
+            normalized["type"] = (
+                "rate_limit_error"
+                if error.get("code") == "rate_limit_exceeded"
+                else "api_error"
+            )
+            return normalized
         return dict(_UNCLASSIFIED)
     return None
 
