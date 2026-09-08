@@ -14,7 +14,6 @@ from sub2api.server.openai import (
     messages_to_prompt,
 )
 
-
 # --- pure mappings ----------------------------------------------------------
 
 
@@ -282,3 +281,103 @@ async def test_responses_requires_api_key(secured_client):
 async def test_responses_get_requires_api_key(secured_client):
     resp = await secured_client.get("/v1/responses/resp_123")
     assert resp.status_code == 401
+
+
+# --- responses-only mode: closure boundary ---------------------------------
+
+
+@pytest.fixture
+async def responses_only_client():
+    settings = AppSettings.from_env(
+        {
+            "SUB2API_CHANNEL": "echo",
+            "SUB2API_API_KEY": "sk-secret",
+            "SUB2API_RESPONSES_ONLY": "1",
+        }
+    )
+    app = create_app(settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        yield client
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/chat",
+        "/v1/chat/stream",
+        "/v1/chat/completions",
+        "/v1/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/v1/messages",
+        "/v1/messages/count_tokens",
+    ],
+)
+async def test_responses_only_disables_other_inference_paths(
+    responses_only_client, path
+):
+    resp = await responses_only_client.post(
+        path,
+        json={"prompt": "hi", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/v1/responses"),
+        ("POST", "/v1/v1/responses"),
+        ("GET", "/v1/responses/resp_123"),
+        ("DELETE", "/v1/responses/resp_123"),
+    ],
+)
+async def test_responses_only_preserves_responses_auth_and_methods(
+    responses_only_client, method, path
+):
+    body = {"model": "echo-mini", "input": "hi"} if method == "POST" else None
+    denied = await responses_only_client.request(method, path, json=body)
+    assert denied.status_code == 401
+    assert denied.json()["error"]["type"] == "authentication_error"
+
+    accepted = await responses_only_client.request(
+        method,
+        path,
+        json=body,
+        headers={"Authorization": "Bearer sk-secret"},
+    )
+    # Echo lacks Responses support: an authenticated request must reach that
+    # existing channel boundary rather than the disabled-route 404.
+    assert accepted.status_code == 501
+    assert accepted.json()["error"]["code"] == "channel_not_supported"
+
+
+@pytest.mark.anyio
+async def test_responses_only_preserves_discovery_and_liveness(responses_only_client):
+    models = await responses_only_client.get(
+        "/v1/models", headers={"Authorization": "Bearer sk-secret"}
+    )
+    assert models.status_code == 200
+    health = await responses_only_client.get("/healthz")
+    assert health.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_chat_completions_restored_when_responses_only_disabled():
+    settings = AppSettings.from_env({"SUB2API_RESPONSES_ONLY": "0"})
+    app = create_app(settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "hi"

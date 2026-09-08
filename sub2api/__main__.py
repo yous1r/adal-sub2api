@@ -36,6 +36,11 @@ def main(argv: list[str] | None = None) -> None:
         help="mount the /admin management UI (also SUB2API_WEB=1)",
     )
     parser.add_argument(
+        "--responses-only",
+        action="store_true",
+        help="serve only the Responses API ingress (also SUB2API_RESPONSES_ONLY=1)",
+    )
+    parser.add_argument(
         "--db",
         default=None,
         help="SQLite store path (default from SUB2API_DB or ~/.adal/sub2api.sqlite3)",
@@ -51,6 +56,8 @@ def main(argv: list[str] | None = None) -> None:
         settings.channel = args.channel
     if args.web:
         settings.web = True
+    if args.responses_only:
+        settings.responses_only = True
     if args.db:
         settings.db = args.db
         # default_db_path() reads SUB2API_DB at call time, and the pool loader

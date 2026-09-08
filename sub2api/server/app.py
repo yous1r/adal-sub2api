@@ -16,19 +16,17 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI
 
 from .. import __version__, channels  # noqa: F401  (channels = registration)
 from ..core.config import AppSettings
 from ..core.registry import create_channel
+from ..core.scheduler import Scheduler
 from ..core.sessions import SessionStore
 from ..core.store import Store
-from ..core.scheduler import Scheduler
 from .deps import AppContext
 from .routes import admin, anthropic, chat, models, openai_compat, responses, usage
-
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
@@ -80,10 +78,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     ctx = AppContext(settings=settings, channel=channel, store=store)
     # Registration order mirrors the pre-split app; each alias travels with the
     # handler it delegates to.  No parameterized path shadows a literal one.
-    app.include_router(chat.router(ctx))
-    app.include_router(openai_compat.router(ctx))
+    # Omit non-Responses inference routers entirely, including their aliases.
+    # Unregistered paths return 404; operational routes remain available.
+    if not settings.responses_only:
+        app.include_router(chat.router(ctx))
+        app.include_router(openai_compat.router(ctx))
     app.include_router(models.router(ctx))
-    app.include_router(anthropic.router(ctx))
+    if not settings.responses_only:
+        app.include_router(anthropic.router(ctx))
     app.include_router(responses.router(ctx))
     app.include_router(usage.router(ctx))
     app.include_router(admin.router(ctx))

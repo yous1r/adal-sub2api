@@ -421,10 +421,27 @@ python -m sub2api --help
 | `--channel` | `SUB2API_CHANNEL` 或 `echo` | 激活渠道 |
 | `--web` | 关 | 挂载 `/admin` 管理界面 |
 | `--db PATH` | `SUB2API_DB` 或 `~/.adal/sub2api.sqlite3` | SQLite 路径；同时导出 `SUB2API_DB`，让计量库与账号来源始终是同一个文件 |
+| `--responses-only` | 关；`SUB2API_RESPONSES_ONLY=1` 时开启 | 仅开放 Responses 推理入口；非 Responses 推理路由及其兼容别名返回 404 |
 
 **默认拒绝匿名启动**：没有 `SUB2API_API_KEY` 时进程直接退出（exit 2）并提示——
 一个不设 key 的网关等于把订阅额度（开了 `--web` 还包括凭证）交给任何能连上端口的人。
 确实要开放时显式设 `SUB2API_ALLOW_ANONYMOUS=1`。该检查只在启动监听时生效，构造 app 对象不受影响。
+
+#### 临时只开放 Responses 推理入口
+
+在**原有启动命令末尾追加 `--responses-only`**，或在启动前设置环境变量；端口、API key、渠道和数据库配置保持不变：
+
+```powershell
+$env:SUB2API_RESPONSES_ONLY = "1"
+# 再使用原来的命令启动 sub2api
+```
+
+- 保留 `POST /v1/responses`、`POST /v1/v1/responses`，以及 `GET` / `DELETE /v1/responses/{id}`，原有鉴权不变。
+- 关闭 Chat Completions 及其兼容别名、自有 `/v1/chat` / `/v1/chat/stream`、Anthropic `/v1/messages` 及其别名和 token 计数入口；这些路径均返回 404，不调用上游。
+- 模型列表、健康检查、用量查询和管理界面不受影响。
+- 这是入口隔离开关，**不会把 Chat 请求转换为 Responses，也不会强制 CLIProxyAPI 自动切换协议**。CLIProxyAPI 若继续向 Chat 端点发请求，会收到 404。
+
+开关只在启动时读取。恢复时，移除 `--responses-only`，并删除 `SUB2API_RESPONSES_ONLY` 或将其设为 `"0"`，再重启进程。默认未开启该开关时，所有原有路由照常提供。
 
 
 ### CLIProxyAPI 接入详细指南
