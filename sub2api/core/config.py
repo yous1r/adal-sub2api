@@ -24,9 +24,10 @@ class AppSettings:
     web: bool = False  # mount the /admin management UI
     db: str | None = None  # SQLite path override (else SUB2API_DB)
     channel_config: ChannelConfig = field(default_factory=ChannelConfig)
+    responses_only: bool = False  # serve only the Responses API ingress
 
     @classmethod
-    def from_env(cls, environ: dict[str, str] | None = None) -> "AppSettings":
+    def from_env(cls, environ: dict[str, str] | None = None) -> AppSettings:
         env = os.environ if environ is None else environ
         options: dict[str, Any] = {}
         raw_options = env.get(f"{ENV_PREFIX}CHANNEL_OPTIONS")
@@ -47,6 +48,7 @@ class AppSettings:
             enabled_tools=enabled_tools,
             proxy=env.get(f"{ENV_PREFIX}PROXY") or None,
             web=env.get(f"{ENV_PREFIX}WEB", "") == "1",
+            responses_only=env.get(f"{ENV_PREFIX}RESPONSES_ONLY", "") == "1",
             db=env.get(f"{ENV_PREFIX}DB") or None,
             channel_config=ChannelConfig(
                 workspace=env.get(f"{ENV_PREFIX}WORKSPACE", "."),

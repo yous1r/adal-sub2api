@@ -17,6 +17,7 @@ def _clean_env(monkeypatch):
         "SUB2API_API_KEY",
         "SUB2API_ALLOW_ANONYMOUS",
         "SUB2API_WEB",
+        "SUB2API_RESPONSES_ONLY",
         "SUB2API_DB",
         "SUB2API_CHANNEL",
         "SUB2API_HOST",
