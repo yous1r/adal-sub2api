@@ -234,26 +234,23 @@ def _translate_messages(messages: list[Any]) -> list[dict[str, Any]]:
             )
             content = raw_message.get("content")
             refusal = raw_message.get("refusal")
-            if refusal is not None:
-                refusal = _required_string(
-                    refusal, f"{param}.refusal", allow_empty=True
-                )
-                if content is None:
-                    content = refusal
-                elif isinstance(content, str):
-                    content = (
-                        f"{content}\n{refusal}"
-                        if content and refusal
-                        else content + refusal
-                    )
-                elif isinstance(content, list):
-                    content = [*content, {"type": "text", "text": refusal}]
+            converted_content: list[dict[str, Any]] = []
             if content is not None:
-                converted_content = _translate_content(content, f"{param}.content")
-                if converted_content or not calls:
-                    translated.append(
-                        {"role": "assistant", "content": converted_content}
+                if content != [] or refusal is None:
+                    converted_content = _translate_assistant_content(
+                        content, f"{param}.content"
                     )
+            if refusal is not None:
+                converted_content.append(
+                    {
+                        "type": "refusal",
+                        "refusal": _required_string(
+                            refusal, f"{param}.refusal", allow_empty=True
+                        ),
+                    }
+                )
+            if converted_content:
+                translated.append({"role": "assistant", "content": converted_content})
             elif not calls:
                 _raise(
                     f"{param}.content",
@@ -351,6 +348,54 @@ def _translate_tool_calls(
         )
         seen_call_ids.add(call_id)
         pending_call_ids.add(call_id)
+    return translated
+
+
+def _translate_assistant_content(content: Any, param: str) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"type": "output_text", "text": content}]
+    if not isinstance(content, list):
+        _raise(param, "must be a string or an array of supported content parts")
+    if not content:
+        _raise(param, "must contain at least one supported content part")
+
+    translated: list[dict[str, Any]] = []
+    for index, raw_part in enumerate(content):
+        part_param = f"{param}[{index}]"
+        if not isinstance(raw_part, dict):
+            _raise(part_param, "must be an object")
+        part_type = raw_part.get("type")
+        if part_type in {"text", "input_text", "output_text"}:
+            _reject_unexpected_fields(
+                raw_part, part_param, {"type", "text", "prompt_cache_breakpoint"}
+            )
+            translated.append(_output_text_part(raw_part, part_param))
+        elif part_type == "refusal":
+            _reject_unexpected_fields(raw_part, part_param, {"type", "refusal"})
+            translated.append(
+                {
+                    "type": "refusal",
+                    "refusal": _required_string(
+                        raw_part.get("refusal"),
+                        f"{part_param}.refusal",
+                        allow_empty=True,
+                    ),
+                }
+            )
+        else:
+            _raise(
+                part_param + ".type",
+                "is not a supported assistant text or refusal content type",
+            )
+    return translated
+
+
+def _output_text_part(part: dict[str, Any], param: str) -> dict[str, Any]:
+    translated = {
+        "type": "output_text",
+        "text": _required_string(part.get("text"), f"{param}.text", allow_empty=True),
+    }
+    _copy_cache_breakpoint(part, translated, param)
     return translated
 
 
