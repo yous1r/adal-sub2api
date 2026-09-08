@@ -18,7 +18,6 @@ from sub2api.compat.aggregate import (
     SSEDecoder,
 )
 
-
 # ---------------------------------------------------------------------------
 # Anthropic
 # ---------------------------------------------------------------------------
@@ -504,7 +503,7 @@ def test_responses_completed_frame_returned_verbatim():
     agg = ResponsesAggregator()
     agg.feed({"type": "response.created", "response": {"id": "resp_1"}})
     agg.feed({"type": "response.completed", "response": response})
-    assert agg.result() is response
+    assert agg.result() == response
     usage = agg.usage()
     assert usage == {
         "input_tokens": 88,
@@ -544,6 +543,33 @@ def test_responses_assembled_from_incremental_events():
     assert result["id"] == "resp_2"
     assert result["model"] == "gpt-5.6-sol"
     assert result["output"][0]["content"][0]["text"] == "answer"
+
+
+def test_responses_incomplete_terminal_replaces_partial_output_and_usage():
+    aggregator = ResponsesAggregator()
+    aggregator.feed(
+        {"type": "response.created", "response": {"usage": {"input_tokens": 1}}}
+    )
+    terminal = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "partial answer"}],
+            }
+        ],
+        "usage": {
+            "input_tokens": 8,
+            "output_tokens": 32,
+            "output_tokens_details": {"reasoning_tokens": 24},
+        },
+    }
+    aggregator.feed({"type": "response.incomplete", "response": terminal})
+    assert aggregator.result() == terminal
+    assert aggregator.usage()["output_tokens"] == 32
+    assert aggregator.usage()["reasoning_tokens"] == 24
 
 
 # ---------------------------------------------------------------------------

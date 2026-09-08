@@ -24,7 +24,7 @@ class AppSettings:
     web: bool = False  # mount the /admin management UI
     db: str | None = None  # SQLite path override (else SUB2API_DB)
     channel_config: ChannelConfig = field(default_factory=ChannelConfig)
-    responses_only: bool = False  # serve only the Responses API ingress
+    responses_only: bool = False  # use Responses upstream, including for Chat ingress
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> AppSettings:

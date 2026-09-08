@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
+from anyio import CancelScope
 
 from ..compat.aggregate import (
     AnthropicAggregator,
@@ -42,6 +45,8 @@ from ..compat.errors import (
 )
 from ..core.pricing import cost_for
 from . import openai as oai
+
+logger = logging.getLogger(__name__)
 
 _NON_STREAM_TIMEOUT = httpx.Timeout(300.0, connect=15.0, read=60.0)
 _STREAM_TIMEOUT = httpx.Timeout(600.0, connect=15.0, read=None)
@@ -181,7 +186,7 @@ class UsageMeter:
             try:
                 await store.record_usage(**row)
             except Exception:  # metering is never load-bearing
-                pass
+                logger.exception("Failed to record request usage")
 
         try:
             asyncio.get_running_loop().create_task(_write())
@@ -376,6 +381,10 @@ async def forward_to_proxy(
                 yield bytes(buffer)
         except Exception:
             ok = False
+            status = 502
+            raise
+        except asyncio.CancelledError:
+            status = 499
             raise
         finally:
             err = parse_error_frame(frames)
@@ -383,10 +392,16 @@ async def forward_to_proxy(
                 ok = False
                 if err is not None:
                     status, _body = error_response_for(protocol, err)
-            await stream_cm.__aexit__(None, None, None)
-            await channel.release_slot(slot, success=ok)
-            if meter is not None:
-                meter.record(status=status, usage=aggregator.usage())
+            elif protocol == "responses" and not aggregator.terminal and status < 400:
+                ok = False
+                status = 502
+            with CancelScope(shield=True):
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                finally:
+                    await channel.release_slot(slot, success=ok)
+                    if meter is not None:
+                        meter.record(status=status, usage=aggregator.usage())
 
     return gen()
 

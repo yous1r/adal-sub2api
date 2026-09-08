@@ -309,9 +309,6 @@ async def responses_only_client():
     [
         "/v1/chat",
         "/v1/chat/stream",
-        "/v1/chat/completions",
-        "/v1/v1/chat/completions",
-        "/v1/completions",
         "/v1/messages",
         "/v1/v1/messages",
         "/v1/messages/count_tokens",
@@ -335,12 +332,22 @@ async def test_responses_only_disables_other_inference_paths(
         ("POST", "/v1/v1/responses"),
         ("GET", "/v1/responses/resp_123"),
         ("DELETE", "/v1/responses/resp_123"),
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/v1/chat/completions"),
+        ("POST", "/v1/completions"),
     ],
 )
 async def test_responses_only_preserves_responses_auth_and_methods(
     responses_only_client, method, path
 ):
-    body = {"model": "echo-mini", "input": "hi"} if method == "POST" else None
+    body = None
+    if method == "POST":
+        body = {"model": "echo-mini", "input": "hi"}
+        if "completions" in path:
+            body = {
+                "model": "echo-mini",
+                "messages": [{"role": "user", "content": "hi"}],
+            }
     denied = await responses_only_client.request(method, path, json=body)
     assert denied.status_code == 401
     assert denied.json()["error"]["type"] == "authentication_error"

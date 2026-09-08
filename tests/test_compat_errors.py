@@ -99,6 +99,25 @@ def test_parse_error_frame_returns_first_error_frame():
     assert err == {"type": "rate_limit_error", "message": "first failure"}
 
 
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {
+            "type": "response.failed",
+            "response": {
+                "error": {"code": "rate_limit_exceeded", "message": "quota exhausted"}
+            },
+        },
+        {"type": "error", "code": "rate_limit_exceeded", "message": "quota exhausted"},
+    ],
+)
+def test_responses_error_shapes_keep_their_rate_limit_classification(frame):
+    error = parse_error_frame([frame])
+    assert error["code"] == "rate_limit_exceeded"
+    assert error["message"] == "quota exhausted"
+    assert status_for_anthropic_error(error["type"]) == 429
+
+
 # --------------------------------------------------------------------------
 # status_for_anthropic_error
 # --------------------------------------------------------------------------
