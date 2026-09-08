@@ -63,6 +63,58 @@ def test_function_history_keeps_order_and_chat_call_ids() -> None:
     assert items[6]["output"] == "beta"
 
 
+def test_assistant_history_uses_responses_output_content_parts() -> None:
+    translated = chat_request_to_responses(
+        {
+            "model": "gpt-6-astra",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "First answer."},
+                        {"type": "input_text", "text": "Second answer."},
+                        {"type": "output_text", "text": "Third answer."},
+                    ],
+                },
+                {"role": "user", "content": "Continue."},
+            ],
+        }
+    )
+
+    assert translated["input"][0] == {
+        "role": "assistant",
+        "content": [
+            {"type": "output_text", "text": "First answer."},
+            {"type": "output_text", "text": "Second answer."},
+            {"type": "output_text", "text": "Third answer."},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "assistant_content",
+    [
+        {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+        {"type": "file", "file": {"file_id": "file_report"}},
+    ],
+)
+def test_assistant_history_rejects_input_only_content_parts(
+    assistant_content: dict[str, object],
+) -> None:
+    with pytest.raises(ChatRequestError) as caught:
+        chat_request_to_responses(
+            {
+                "model": "gpt-6-astra",
+                "messages": [
+                    {"role": "assistant", "content": [assistant_content]},
+                    {"role": "user", "content": "Continue."},
+                ],
+            }
+        )
+
+    assert caught.value.param == "messages[0].content[0].type"
+
+
 def test_mixed_content_and_typed_tool_result_use_responses_parts() -> None:
     translated = chat_request_to_responses(
         {
@@ -261,7 +313,7 @@ def test_unrepresentable_or_malformed_requests_fail_at_the_affected_parameter(
     assert param in str(caught.value)
 
 
-def test_refusal_history_remains_public_assistant_text():
+def test_refusal_history_uses_native_assistant_content_part() -> None:
     refusal = "I cannot provide that information."
     translated = chat_request_to_responses(
         {
@@ -272,7 +324,10 @@ def test_refusal_history_remains_public_assistant_text():
             ],
         }
     )
-    assert translated["input"][0] == {"role": "assistant", "content": refusal}
+    assert translated["input"][0] == {
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": refusal}],
+    }
     assert translated["input"][1]["role"] == "user"
 
 

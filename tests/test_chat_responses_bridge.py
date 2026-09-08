@@ -243,6 +243,55 @@ async def test_chat_sdk_completes_reasoning_tool_round_trip(bridge_gateway):
 
 
 @pytest.mark.anyio
+async def test_chat_history_input_text_reaches_upstream_as_output_text(bridge_gateway):
+    def upstream(request):
+        assert request.url.path == "/proxy/v1/responses"
+        body = json.loads(request.content)
+        assert body["input"][0] == {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "A prior answer."}],
+        }
+        return httpx.Response(
+            200,
+            json=_response(
+                [
+                    {
+                        "type": "message",
+                        "id": "msg_confirmation",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Confirmed.",
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                ]
+            ),
+        )
+
+    client, _ = bridge_gateway(upstream)
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-6-astra",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": "A prior answer."}],
+                },
+                {"role": "user", "content": "What did you say?"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Confirmed."
+
+
+@pytest.mark.anyio
 async def test_unrepresentable_choices_fail_before_upstream(bridge_gateway):
     requests = []
 
