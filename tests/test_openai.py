@@ -309,9 +309,6 @@ async def responses_only_client():
     [
         "/v1/chat",
         "/v1/chat/stream",
-        "/v1/messages",
-        "/v1/v1/messages",
-        "/v1/messages/count_tokens",
     ],
 )
 async def test_responses_only_disables_other_inference_paths(
@@ -335,6 +332,9 @@ async def test_responses_only_disables_other_inference_paths(
         ("POST", "/v1/chat/completions"),
         ("POST", "/v1/v1/chat/completions"),
         ("POST", "/v1/completions"),
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/v1/messages"),
+        ("POST", "/v1/messages/count_tokens"),
     ],
 )
 async def test_responses_only_preserves_responses_auth_and_methods(

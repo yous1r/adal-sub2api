@@ -78,14 +78,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     ctx = AppContext(settings=settings, channel=channel, store=store)
     # Registration order mirrors the pre-split app; each alias travels with the
     # handler it delegates to.  No parameterized path shadows a literal one.
-    # Responses-only keeps Chat compatibility through the Responses bridge;
-    # normalized Chat and Anthropic routes remain unregistered.
+    # Responses-only speaks to OpenAI ingress — Chat Completions is bridged to
+    # Responses — and leaves the Anthropic endpoints on their native
+    # passthrough, so the only route it removes is the normalized Chat pair.
     if not settings.responses_only:
         app.include_router(chat.router(ctx))
     app.include_router(openai_compat.router(ctx))
     app.include_router(models.router(ctx))
-    if not settings.responses_only:
-        app.include_router(anthropic.router(ctx))
+    app.include_router(anthropic.router(ctx))
     app.include_router(responses.router(ctx))
     app.include_router(usage.router(ctx))
     app.include_router(admin.router(ctx))
